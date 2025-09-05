@@ -1,0 +1,16 @@
+name: dxc-ai
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pandas
+  - pyarrow
+  - duckdb
+  - scikit-learn
+  - jupyter
+  - pip
+  - pip:
+      - streamlit
+      - pyod
+      - plotly
