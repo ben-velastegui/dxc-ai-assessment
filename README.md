@@ -35,3 +35,39 @@ I experimented with a range of models to understand how different architectures 
 * No single model captures all signals perfectly.
 * Tree-based or attention models provide better explainability, even if deep learning models achieve higher numerical accuracy.
 * A multi-pronged approach improves robustness across multi-modal telemetry.
+
+
+## Data Source: Multi-Source Distributed System Data for AI-powered Analytics
+Title: Multi-Source Distributed System Data for AI-Powered Analytics 
+Authors: Sasho Nedelkoski, Jasmin Bogatinovski, Ajay Kumar Mandapati, Soeren Becker, Jorge Cardoso, Odej Kao 
+Published: October 14, 2019 (Version 1.1) 
+License: Creative Commons Attribution 4.0 (CC BY 4.0) 
+
+### What’s in the Dataset
+Data modalities:
+The dataset includes three kinds of observability / telemetry data from a complex distributed system (OpenStack):
+* Application logs
+* Metrics
+* Distributed traces 
+
+Workload / Fault-Injection Scripts:
+It also provides the workload scripts (user requests), fault scripts, and a Rally report which can serve as ground truth for experiments. 
+
+Two variants of workload execution:
+  * Sequential workload (“sequential_data”) — user requests executed sequentially.
+  * Concurrent workload (“concurrent_data”) — user requests executed in parallel / concurrently. 
+
+Data synchronization and timing:
+* The logs and metrics are time-synchronized, and recorded in Central European Summer Time (CEST).
+* The traces are in UTC (which is two hours behind CEST). When combining modalities (logs, metrics, traces), care must be taken to align timestamps correctly.
+* There is a file „IMPORTANT_experiment_start_end.txt“ that gives the proper time windows for filtering / aligning the logs and metrics with respect to each dataset. 
+
+Size / Structure
+The datasets are large (hundreds of MBs per zipped variant):
+* concurrent_data.zip (~335.4 MB)
+* sequential_data.zip (~315.1 MB)  
+
+How It Maps to My Project
+* Because it has multi-modal telemetry (logs, metrics, traces), it supports your goal to experiment with different models and see how each modality contributes to anomaly detection, correlation, etc.
+* The ground-truth via workloads and fault scripts + Rally report gives you a concrete basis for evaluating model accuracy, precision/recall, etc.
+* The need to synchronize different time zones / timestamp sources is a practical challenge I can demonstrate in my data-layer / preprocessing workflows.
