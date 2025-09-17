@@ -1,0 +1,2713 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Load packages
+
+```{r}
+# Load required libraries
+library(readr)
+library(dplyr)
+library(plotly)
+library(DT)
+library(viridis)
+
+# Helper so you can keep writing ggplot code and make it interactive in one line
+ggI <- function(p) ggplotly(p, dynamicTicks = TRUE, tooltip = "text")
+
+# Pretty continuous palette for heatmaps, etc.
+vir <- viridis::viridis(200)
+
+```
+
+
+
+# Load the Sequentialdata
+```{r}
+# Define base path (adjust if needed)
+base_path <- "~/Desktop/DXC AI team assesment/data/processed/sequential_data"
+
+# Load datasets
+logs <- read_csv(file.path(base_path, "logs", "logs_aggregated_sequential.csv"))
+metrics <- read_csv(file.path(base_path, "metrics", "combined_sequential_metrics.csv"))
+traces <- read_csv(file.path(base_path, "traces", "combined_sequential_traces.csv"))   
+trace_ids <- read_csv(file.path(base_path, "traces", "trace_ID", "sequential_trace_ids.csv"))
+reports <- read_csv(file.path(base_path, "reports", "flattened_sequential_reports.csv"))
+```
+
+# Filter according to the ReadMe associated with the Sequential data
+
+```{r}
+# --- Helper to show counts ---
+show_counts <- function(df, df_name) {
+  cat(paste0("\n", df_name, ":\n"))
+  cat("  Before filtering: ", nrow(df), "\n")
+}
+
+# Store originals for comparison
+logs_orig <- logs
+metrics_orig <- metrics
+traces_orig <- traces
+
+# --- Filtering with consistent UTC ---
+trace_start <- as.POSIXct("2019-11-19 17:38:39", tz = "UTC")
+trace_end   <- as.POSIXct("2019-11-20 01:30:00", tz = "UTC")
+
+log_metric_start <- as.POSIXct("2019-11-19 18:38:39", tz = "UTC")
+log_metric_end   <- as.POSIXct("2019-11-20 02:30:00", tz = "UTC")
+
+logs <- logs %>%
+  mutate(`@timestamp` = as.POSIXct(`@timestamp`, tz = "UTC"))
+
+metrics <- metrics %>%
+  mutate(now = as.POSIXct(now, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"))
+
+traces <- traces %>%
+  mutate(Timestamp = as.POSIXct(Timestamp, tz = "UTC"))
+
+# Print before counts
+show_counts(logs_orig, "Logs")
+show_counts(metrics_orig, "Metrics")
+show_counts(traces_orig, "Traces")
+
+# Filter datasets
+logs_filtered <- logs %>%
+  filter(`@timestamp` >= log_metric_start & `@timestamp` <= log_metric_end)
+
+metrics_filtered <- metrics %>%
+  filter(now >= log_metric_start & now <= log_metric_end)
+
+traces_filtered <- traces %>%
+  filter(Timestamp >= trace_start & Timestamp <= trace_end)
+
+# Print after counts
+cat("\nAfter filtering:\n")
+cat("  Logs:    ", nrow(logs_filtered), "\n")
+cat("  Metrics: ", nrow(metrics_filtered), "\n")
+cat("  Traces:  ", nrow(traces_filtered), "\n")
+
+```
+
+
+# Check data dimensions
+
+```{r}
+# Show column names for each dataset
+cat("Logs column names:\n")
+print(names(logs_filtered))
+
+cat("\nMetrics column names:\n")
+print(names(metrics_filtered))
+
+cat("\nTraces column names:\n")
+print(names(traces_filtered))
+
+cat("\nTrace IDs column names:\n")
+print(names(trace_ids))
+
+# Show structure (data types + preview) for each dataset
+cat("\n--- Logs structure ---\n")
+str(logs_filtered)
+
+cat("\n--- Metrics structure ---\n")
+str(metrics_filtered)
+
+cat("\n--- Traces structure ---\n")
+str(traces_filtered)
+
+cat("\n--- Trace IDs structure ---\n")
+str(trace_ids)
+
+
+# Quick summary for each dataset
+cat("\n--- Logs summary ---\n")
+print(summary(logs_filtered))
+
+cat("\n--- Metrics summary ---\n")
+print(summary(metrics_filtered))
+
+cat("\n--- Traces summary ---\n")
+print(summary(traces_filtered))
+
+cat("\n--- Trace IDs summary ---\n")
+print(summary(trace_ids))
+
+```
+
+
+
+# Investigate the seperate datasets
+
+
+```{r}
+# Log EDA
+# Basic structure
+dim(logs_filtered)
+summary(logs_filtered)
+
+# Missing values per column
+sapply(logs_filtered, function(x) sum(is.na(x)))
+
+# Distribution of log levels
+library(ggplot2)
+logs_filtered %>%
+  count(log_level, sort = TRUE) %>%
+  ggplot(aes(x = reorder(log_level, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Log Level Distribution", x = "Log Level", y = "Count")
+
+# HTTP status distribution (ignoring NAs)
+logs_filtered %>%
+  filter(!is.na(http_status)) %>%
+  count(http_status) %>%
+  ggplot(aes(x = http_status, y = n)) +
+  geom_col() +
+  labs(title = "HTTP Status Codes", x = "Status Code", y = "Count")
+
+# Logs over time
+logs_filtered %>%
+  mutate(minute = lubridate::floor_date(`@timestamp`, "minute")) %>%
+  count(minute) %>%
+  ggplot(aes(x = minute, y = n)) +
+  geom_line() +
+  labs(title = "Log Volume Over Time", x = "Time", y = "Logs per Minute")
+```
+
+1. Log Level Distribution
+
+	•	INFO dominates (~80k logs), which is typical in many systems.
+	•	NA entries are the next largest (~22k), suggesting some logs didn’t capture log_level properly → might need cleaning or mapping.
+	•	WARNING exists (~3k logs), with very few ERROR/error entries → system rarely crashes but does show warnings.
+
+👉 Action: Decide if NA can be classified (e.g., default INFO) or should be treated as missing.
+
+2. HTTP Status Codes
+
+	•	Mostly 200–204 → successful requests.
+	•	Some 300 (redirects) and 400+ (client errors), but very few compared to successes.
+	•	Large chunk of NA (~83k), meaning HTTP status isn’t always logged.
+
+👉 Action: Separate log types — system logs vs API access logs.
+
+3. Log Volume Over Time
+
+	•	Clear activity bursts and quiet periods:
+	•	Early on: spiky traffic (peaks up to ~800/min).
+	•	Around 21:00: nearly flat zero logs → possible downtime or logging disabled.
+	•	Later: stable steady flow (300–500/min).
+	•	After ~01:00: drops to almost zero again.
+
+👉 Action: Investigate downtime periods (are they scheduled? outages?).
+
+4. Data Summary
+
+	•	105,533 logs across 23 fields.
+	•	High missingness in http_status, http_method, http_version, http_url (80k+ NAs).
+	•	Other metadata like tenant_id, domain_id, user_id missing in ~26k logs → possibly system background logs.
+	
+	
+	This EDA suggests:
+	•	Logs are mostly INFO/system logs, not errors.
+	•	There are structured API logs mixed with unstructured system logs.
+	•	Clear time-based patterns (bursts + gaps) worth correlating with errors/warnings.
+
+
+
+```{r}
+# Metrics EDA
+# Summary
+summary(metrics_filtered)
+
+# Missing values
+sapply(metrics_filtered, function(x) sum(is.na(x)))
+
+# CPU distribution
+ggplot(metrics_filtered, aes(x = cpu.user)) +
+  geom_histogram(bins = 50, fill = "skyblue") +
+  labs(title = "CPU Usage Distribution", x = "CPU %", y = "Count")
+
+# Memory usage distribution
+ggplot(metrics_filtered, aes(x = mem.used/1e9)) +
+  geom_histogram(bins = 50, fill = "salmon") +
+  labs(title = "Memory Usage Distribution", x = "Memory (GB)", y = "Count")
+
+# Time series: CPU usage
+metrics_filtered %>%
+  mutate(minute = lubridate::floor_date(now, "minute")) %>%
+  group_by(minute) %>%
+  summarise(cpu_avg = mean(cpu.user, na.rm = TRUE)) %>%
+  ggplot(aes(x = minute, y = cpu_avg)) +
+  geom_line() +
+  labs(title = "Average CPU Usage Over Time", x = "Time", y = "CPU %")
+
+# Correlation heatmap
+# Correlation heatmap without GGally
+library(ggplot2)
+library(reshape2)
+
+# Select numeric metrics
+metrics_num <- metrics_filtered %>%
+  select(cpu.user, mem.used, load.min1, load.min5, load.min15)
+
+# Compute correlation matrix
+cor_mat <- cor(metrics_num, use = "pairwise.complete.obs")
+
+# Melt for plotting
+cor_melt <- melt(cor_mat)
+
+# Plot heatmap
+ggplot(cor_melt, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 2)), color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0) +
+  labs(title = "Correlation Heatmap of Metrics", x = "", y = "") +
+  theme_minimal()
+```
+
+From Metrics EDA
+
+	•	CPU Usage Distribution
+	•	Mostly between 10–25%.
+	•	Occasional higher spikes (up to 80%).
+	•	Suggests workloads were generally light/moderate, with some transient stress events.
+	•	Memory Usage Distribution
+	•	Clustered around 3–5 GB and 12–14 GB, suggesting possibly two types of workloads or multiple nodes with different resource footprints.
+	•	CPU Time Series
+	•	Highly variable (oscillations in load).
+	•	Clear dip between 9:20 pm–10:30 pm (~16% avg CPU).
+	•	This may align with log volume variance — worth overlaying logs + CPU to check correlation.
+	•	Correlation Heatmap
+	•	CPU and system load strongly correlated (expected).
+	•	Memory usage shows weak correlation to CPU/load.
+	•	Suggests workloads are not memory-bound, but CPU and scheduling-driven.
+
+
+```{r}
+# Traces EDA
+# Summary
+summary(traces_filtered)
+
+# Missing values
+sapply(traces_filtered, function(x) sum(is.na(x)))
+
+# Top operations
+traces_filtered %>%
+  count(operation, sort = TRUE) %>%
+  slice_head(n = 15)
+
+# Count by project
+traces_filtered %>%
+  count(Project, sort = TRUE)
+
+# Trace events over time
+traces_filtered %>%
+  mutate(minute = lubridate::floor_date(Timestamp, "minute")) %>%
+  count(minute) %>%
+  ggplot(aes(x = minute, y = n)) +
+  geom_line() +
+  labs(title = "Trace Events Over Time", x = "Time", y = "Count")
+```
+
+
+Trace Analysis Summary
+1. Volume & Distribution
+
+872,396 trace events over ~7.5 hours
+Clean data with no missing values across all fields
+Events distributed across 4 main OpenStack services
+
+2. Service Activity Breakdown
+
+Nova (Compute): 785,410 events (90%) - dominant service
+Neutron (Network): 50,393 events (6%)
+Keystone (Identity): 20,642 events (2%)
+Glance (Image): 15,951 events (2%)
+
+3. Top Operations
+
+boot_delete: 838,438 events - massive VM lifecycle activity
+image_create_delete: 22,867 events - image management
+network_create_delete: 11,091 events - network provisioning
+
+4. Time Pattern Analysis
+From your chart, I can see:
+
+Early period (17:30-19:00): Low, steady activity (~500 events/min)
+Quiet period (19:00-21:00): Nearly zero activity - aligns with your log analysis
+High activity burst (21:00-01:00): Intense compute workload (4,000-5,000 events/min)
+Final period (01:00+): Activity drops back to baseline
+
+Cross-Dataset Correlations
+Timing Alignment: The trace data perfectly correlates with your logs and metrics:
+
+The quiet period around 21:00 appears in all three datasets
+The high activity burst matches the CPU spikes in your metrics
+The dominance of INFO logs aligns with normal operations during heavy VM provisioning
+
+Workload Characteristics:
+
+The massive boot_delete activity suggests automated testing, CI/CD, or ephemeral workload patterns
+Memory usage clustering (3-5GB and 12-14GB) likely corresponds to different VM sizes being provisioned
+CPU oscillations match the bursty nature of VM lifecycle operations
+
+This looks like a cloud infrastructure under heavy automated workload - possibly continuous integration testing or auto-scaling scenarios where VMs are rapidly created and destroyed.
+
+
+
+```{r}
+# Traces ID EDA
+# Summary
+summary(trace_ids)
+
+# Number of unique trace IDs
+n_distinct(trace_ids$trace_id)
+
+# Number of scenarios (unique file paths)
+n_distinct(trace_ids$file_path)
+
+# Traces per scenario
+trace_ids %>%
+  count(file_path) %>%
+  arrange(desc(n)) %>%
+  head(15) %>%
+  ggplot(aes(x = reorder(file_path, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top Scenarios by Trace Count", x = "Scenario", y = "Trace Count")
+```
+
+Key Findings from Trace ID Distribution
+1. Massive Scale Variance
+
+Top 2 scenarios dominate with ~7,500-8,000 traces each
+These represent about 6% of all scenarios but likely a significant portion of total activity
+The long tail shows most scenarios (2,748 others) have much lower trace counts
+
+2. Scenario Characteristics
+Looking at the file paths, all top scenarios are boot_delete operations with unique UUIDs, which tells us:
+
+Each scenario represents a distinct VM lifecycle test case
+The UUIDs suggest these are automated test runs or CI/CD pipeline executions
+Some test scenarios are much more complex or run more frequently than others
+
+3. Workload Distribution Insights
+
+2,750 unique scenarios but only 829,562 unique trace IDs from 2,488,675 total traces
+This means: Average ~3 trace events per unique trace ID
+Some scenarios generate 20x more traces than typical scenarios
+
+Cross-Analysis Implications
+Heavy Hitters: The top 2 scenarios (d39343a2... and 2597e7f6...) are likely:
+
+Load testing scenarios with complex multi-step operations
+Integration tests that exercise multiple OpenStack services
+Performance benchmarks that repeat operations multiple times
+
+System Impact: These high-trace scenarios probably correspond to:
+
+The CPU spikes you saw in metrics (complex operations require more compute)
+The burst periods in your time series (when these heavy scenarios run)
+The INFO log volume (each trace step generates multiple log entries)
+
+Operational Patterns: The distribution suggests this is a test/development environment where:
+
+Different teams run various complexity levels of tests
+Some scenarios are regression tests (run frequently, high trace counts)
+Others are exploratory tests (run occasionally, low trace counts)
+
+
+
+# --------------------------------------------------
+
+Next Steps
+
+	1.	Overlay Time Series (Logs + Metrics + Traces)
+	•	Plot all three against a common timeline.
+	•	You’ll be able to show e.g. “At 21:00, CPU dips → traces drop → logs go flat → system quiet.”
+	2.	Zoom into Anomaly Windows
+	•	19:00–21:00 (quiet period).
+	•	21:00–01:00 (bursts, warnings/errors).
+	•	01:00–02:30 (drop to baseline).
+	•	Count warnings/errors, failed ops, and correlate with resource metrics.
+	3.	Feature Engineering for ML
+	•	Aggregate logs/metrics/traces per time window.
+	•	Features like: trace_op_ratio, error_count, warn_count, cpu.user_avg, mem.used_avg, log_volume.
+	•	Label anomaly windows (manual or via reconstruction error).
+	4.	Prototype Transformer Model (later)
+	•	Input = sequences of (logs, metrics, traces) per time slice.
+	•	Output = anomaly score + attention maps for explainability.
+
+	
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+
+## --- Logs per minute ---
+logs_minute <- logs %>%
+  mutate(ts = `@timestamp`,
+         minute = floor_date(ts, "minute")) %>%
+  group_by(minute) %>%
+  summarise(log_count = n(),
+            warn_count = sum(log_level == "WARNING", na.rm = TRUE),
+            error_count = sum(tolower(log_level) == "error", na.rm = TRUE))
+
+## --- Metrics per minute ---
+metrics_minute <- metrics %>%
+  mutate(minute = floor_date(now, "minute")) %>%
+  group_by(minute) %>%
+  summarise(cpu = mean(cpu.user, na.rm = TRUE),
+            mem = mean(mem.used, na.rm = TRUE))
+
+## --- Traces per minute ---
+traces_minute <- traces %>%
+  mutate(minute = floor_date(Timestamp, "minute")) %>%
+  group_by(minute) %>%
+  summarise(trace_count = n())
+
+## --- Combine all ---
+overlay <- logs_minute %>%
+  full_join(metrics_minute, by = "minute") %>%
+  full_join(traces_minute, by = "minute") %>%
+  arrange(minute)
+
+## --- Plot ---
+ggplot(overlay, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count), color = "Logs")) +
+  geom_line(aes(y = scale(cpu), color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  labs(title = "Overlay Time Series: Logs, Metrics, Traces",
+       y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green"))
+```
+
+```{r}
+# Add warn_count and error_count to Time Series
+## You already compute these in logs_minute. To visualize them:
+  
+ggplot(overlay, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count), color = "Logs")) +
+  geom_line(aes(y = scale(cpu), color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  geom_line(aes(y = scale(warn_count), color = "Warnings"), linetype = "dashed") +
+  geom_line(aes(y = scale(error_count), color = "Errors"), linetype = "dotted") +
+  labs(title = "Overlay Time Series: Logs, Metrics, Traces, Warnings, Errors",
+       y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green",
+                                "Warnings" = "orange", "Errors" = "black"))
+
+```
+
+Key Observations:
+CPU (red line): Highly volatile on Nov 20 with sharp spikes and drops, suggesting bursts of compute-intensive activity. It stabilizes on Nov 21.
+Logs, Traces, Warnings: Dense activity early on Nov 20, tapering off later. This likely reflects a high-load period—perhaps a deployment, batch job, or stress test.
+Errors (black dotted lines): Discrete events scattered throughout, not necessarily aligned with CPU spikes, which may indicate intermittent failures or retries.
+
+
+
+Do CPU spikes precede warnings or errors?
+Yes, they often do. In the first graph ("Overlay Time Series"), CPU usage shows sharp spikes—especially on November 20—followed closely by bursts of warnings (green dashed lines) and intermittent error events (black dotted lines). The temporal alignment suggests that CPU stress may be a precursor to system instability, triggering warnings and, in some cases, errors.
+This pattern is typical in systems where resource exhaustion leads to degraded performance or failed operations.
+
+
+
+```{r}
+# Segment Trace Types by Operation
+# To break down trace volume by operation (e.g., boot_delete, image_create_delete):
+  
+traces_by_op <- traces %>%
+  mutate(minute = floor_date(Timestamp, "minute")) %>%
+  group_by(minute, operation) %>%
+  summarise(trace_count = n()) %>%
+  ungroup()
+
+ggplot(traces_by_op, aes(x = minute, y = trace_count, color = operation)) +
+  geom_line() +
+  labs(title = "Trace Volume by Operation",
+       x = "Time", y = "Trace Count")
+
+```
+
+Key Observations:
+boot_delete (red): Dominates trace volume, peaking between 20:30 and 23:30. This operation is clearly the most active and possibly the most resource-intensive.
+image_create_delete (green) and network_create_delete (blue): Low and stable trace counts, suggesting minimal impact or lower frequency.
+
+Which operations deserve deeper investigation or architectural review?
+Based on the second graph ("Trace Volume by Operation") and the overlays in the third graph, the top candidate is:
+🟥 boot_delete (NovaServers.boot_and_delete_server)
+Trace volume is massive—peaking near 5000.
+It aligns with CPU spikes and log surges.
+It’s the most disruptive operation in terms of system load.
+🟦 GlanceImages.create_and_delete_image
+Generates significant logs.
+Appears during high-load windows.
+May be verbose or error-prone.
+🟩 NeutronNetworks.create_and_delete_networks
+Lower impact overall, but still worth reviewing if network latency or provisioning issues arise.
+
+```{r}
+# Correlate with External Events (reports)
+# This will visually correlate system behavior with known workloads—especially the massive boot_and_delete_server run that aligns with your CPU and trace burst.
+
+report_events <- reports %>%
+  select(subtask_title, subtask_created_at, subtask_updated_at)
+
+ggplot(overlay, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count), color = "Logs")) +
+  geom_line(aes(y = scale(cpu), color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  geom_rect(data = report_events,
+            aes(xmin = subtask_created_at, xmax = subtask_updated_at,
+                ymin = -Inf, ymax = Inf, fill = subtask_title),
+            alpha = 0.2, inherit.aes = FALSE) +
+  labs(title = "Overlay with External Report Events",
+       y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green"))
+
+```
+
+Metrics (CPU, Logs, Traces) are plotted alongside shaded regions representing subtasks:
+GlanceImages.create_and_delete_image
+NeutronNetworks.create_and_delete_networks
+NovaServers.boot_and_delete_server
+CPU spikes and log surges appear to align with NovaServers and GlanceImages events.
+
+This is your cause-and-effect dashboard. It shows how specific subtasks impact system metrics:
+NovaServers tasks correlate with CPU and trace spikes—likely due to boot/delete operations.
+GlanceImages events may be driving log volume, suggesting verbose or error-prone image handling.
+
+
+Are logs and traces surging during specific operational windows?
+Absolutely. The third graph ("Overlay with External Report Events") overlays CPU, logs, and traces with shaded regions representing subtasks. You can clearly see:
+Logs and traces spike during NovaServers.boot_and_delete_server and GlanceImages.create_and_delete_image operations.
+These surges are tightly coupled with CPU activity, reinforcing that these operations are high-impact and generate substantial telemetry.
+This confirms that specific operations—notably boot/delete and image handling—are driving observability volume.
+
+
+Is there a cooling-off period after intense activity?
+Yes, and it’s quite visible. In both the first and third graphs, after the dense activity early on November 20, there’s a noticeable decline in CPU, logs, traces, warnings, and errors. By November 21, the system appears to stabilize, suggesting a cooling-off period—likely after a batch job, deployment, or stress test.
+This tapering effect is useful for identifying natural recovery windows or validating the impact of throttling mechanisms.
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+## --- Anomaly windows summary ---
+anomalies <- overlay %>%
+  mutate(window = case_when(
+    minute >= ymd_hm("2019-11-19 19:00") & minute < ymd_hm("2019-11-19 21:00") ~ "Quiet (19-21)",
+    minute >= ymd_hm("2019-11-19 21:00") & minute < ymd_hm("2019-11-20 01:00") ~ "Bursts (21-01)",
+    minute >= ymd_hm("2019-11-20 01:00") & minute < ymd_hm("2019-11-20 02:30") ~ "Drop (01-02:30)",
+    TRUE ~ "Normal"
+  )) %>%
+  group_by(window) %>%
+  summarise(
+    logs = sum(log_count, na.rm = TRUE),
+    warnings = sum(warn_count, na.rm = TRUE),
+    errors = sum(error_count, na.rm = TRUE),
+    avg_cpu = mean(cpu, na.rm = TRUE),
+    avg_mem = mean(mem, na.rm = TRUE),
+    traces = sum(trace_count, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(anomalies)
+```
+
+
+```{r}
+## --- Features for ML ---
+features <- overlay %>%
+  mutate(trace_op_ratio = trace_count / (log_count + 1)) %>%
+  select(minute, log_count, warn_count, error_count,
+         cpu, mem, trace_count, trace_op_ratio)
+
+## --- Add labels for anomaly detection ---
+features <- features %>%
+  mutate(label = case_when(
+    minute >= ymd_hm("2019-11-19 19:00") & minute < ymd_hm("2019-11-19 21:00") ~ "anomaly",
+    minute >= ymd_hm("2019-11-19 21:00") & minute < ymd_hm("2019-11-20 01:00") ~ "anomaly",
+    minute >= ymd_hm("2019-11-20 01:00") & minute < ymd_hm("2019-11-20 02:30") ~ "anomaly",
+    TRUE ~ "normal"
+  ))
+```
+
+
+```{r}
+library(ggplot2)
+library(lubridate)
+
+# Define anomaly windows for shading
+anomaly_windows <- data.frame(
+  start = ymd_hm(c("2019-11-19 19:00", "2019-11-19 21:00", "2019-11-20 01:00")),
+  end   = ymd_hm(c("2019-11-19 21:00", "2019-11-20 01:00", "2019-11-20 02:30")),
+  label = c("Quiet (19-21)", "Bursts (21-01)", "Drop (01-02:30)")
+)
+
+# Plot with anomalies highlighted
+ggplot(overlay, aes(x = minute)) +
+  # anomaly shading
+  geom_rect(data = anomaly_windows,
+            aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf, fill = label),
+            inherit.aes = FALSE, alpha = 0.2) +
+  # log volume line
+  geom_line(aes(y = log_count, color = "Logs")) +
+  # cpu line
+  geom_line(aes(y = cpu, color = "CPU")) +
+  # trace line
+  geom_line(aes(y = trace_count, color = "Traces")) +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green")) +
+  labs(title = "Overlay of Logs, CPU, and Traces with Anomaly Windows",
+       y = "Counts / CPU %",
+       x = "Time",
+       color = "Metric",
+       fill = "Anomaly Window") +
+  theme_minimal()
+```
+Do CPU spikes precede warnings or errors?
+Not strongly. From both the plot and the anomaly summary:
+CPU remains relatively stable across all windows, with average values hovering around 17.7–17.9%.
+Despite this, warnings and errors spike during the “Bursts (21–01)” window:
+Warnings: 2,489
+Errors: 9
+This suggests that CPU is not the primary trigger for warnings or errors in this case. Instead, the surge in trace and log volume during Bursts (803,927 traces and 76,695 logs) is more likely the culprit—possibly overwhelming the system or revealing latent issues.
+
+
+Are logs and traces surging during specific operational windows?
+Yes—very clearly during “Bursts (21–01).”
+Logs: 76,695 (highest of all windows)
+Traces: 803,927 (massive spike)
+This aligns with the shaded pink region in your plot, where both logs and traces visibly surge.
+This window likely corresponds to a high-throughput operation like boot_delete, which we previously identified as trace-heavy. The correlation is strong and suggests that this operational window is a hotspot for observability data.
+
+
+Is there a cooling-off period after intense activity?
+Yes—during “Drop (01–02:30)” and “Quiet (19–21).”
+In the Drop window, logs and traces fall dramatically:
+Logs: 4,988
+Traces: 34,511
+In the Quiet window, the system is even calmer:
+Logs: 18,980
+Traces: 11,091
+This cooling-off is visible in the plot as well, especially in the light blue shaded region. It suggests the system either completed its workload or entered a throttled/idle state.
+
+
+Which operations deserve deeper investigation or architectural review?
+Based on all visuals and metrics, the top candidate remains:
+🟥 boot_delete (NovaServers.boot_and_delete_server)
+Dominates trace volume in the second graph.
+Likely responsible for the “Bursts” anomaly window.
+Needs performance tuning, trace sampling, and possibly architectural redesign.
+🟦 GlanceImages.create_and_delete_image
+Associated with high log volume.
+May be verbose or inefficient in logging behavior.
+🟩 NeutronNetworks.create_and_delete_networks
+Lower impact, but could be reviewed for latency or provisioning reliability.
+
+
+# ------------------------------------------
+
+# Create a single unified dataset by establishing a time window
+
+
+Since you filtered everything to the ReadMe’s experiment window, your metrics and traces datasets are already aligned in terms of time coverage. But:
+Metrics are sampled very frequently (every few seconds, sometimes sub-second).
+Traces are more event-based (they appear only when a user request or workflow executes).
+That means they’re not 1-to-1 aligned by row, but they can be aligned by timestamp windows (e.g., aggregate metrics into 1s, 5s, or 10s buckets, then attach traces that fall inside).
+Why this matters for a multi-modal model
+A multi-modal model takes in different modalities (e.g., numeric metrics + categorical trace/log info) in parallel. Instead of smashing everything into one giant table, you can do:
+Metrics branch → numeric features (CPU %, memory, load averages).
+Traces branch → categorical/text features (service, operation, duration).
+Logs branch (optional) → textual or structured features (log_level, http_status, payload keywords).
+Then you align them by time windows so that all branches are describing the system at the “same moment.”
+
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+# --- Metrics: avg + max per 5s ---
+metrics_binned <- metrics_filtered %>%
+  mutate(window = floor_date(now, unit = "5 seconds")) %>%
+  group_by(window) %>%
+  summarise(
+    across(c(cpu.user, mem.used, load.cpucore, load.min1, load.min5, load.min15),
+           list(avg = mean, max = max), .names = "{.col}_{.fn}"),
+    .groups = "drop"
+  )
+
+# --- Logs: count errors/warnings per 5s ---
+logs_binned <- logs_filtered %>%
+  mutate(
+    window = floor_date(`@timestamp`, unit = "5 seconds"),
+    log_level_upper = toupper(log_level)
+  ) %>%
+  group_by(window) %>%
+  summarise(
+    error_count = sum(log_level_upper == "ERROR"),
+    warn_count  = sum(log_level_upper == "WARNING"),
+    .groups = "drop"
+  )
+
+# --- Traces: count total + unique trace_ids per 5s ---
+traces_binned <- traces_filtered %>%
+  mutate(window = floor_date(Timestamp, unit = "5 seconds")) %>%
+  group_by(window) %>%
+  summarise(
+    total_ops   = n(),
+    trace_count = n_distinct(Trace_id),
+    trace_ids   = paste(unique(Trace_id), collapse = ", "),  # store trace IDs in one string
+    .groups = "drop"
+  )
+
+# --- Join everything by window ---
+library(dplyr)
+
+aligned_data <- full_join(metrics_binned, logs_binned, by = "window") %>%
+  full_join(traces_binned, by = "window")
+
+aligned_data <- aligned_data %>%
+  mutate(
+    error_count = replace_na(error_count, 0),
+    warn_count  = replace_na(warn_count, 0),
+    total_ops   = replace_na(total_ops, 0)
+  )
+
+
+```
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(tidyr)  # for replace_na
+
+# --- 1. Define a common 5-second grid ---
+experiment_start <- as.POSIXct("2019-11-19 18:38:39", tz = "UTC")
+experiment_end   <- as.POSIXct("2019-11-20 02:30:00", tz = "UTC")
+
+# Generate sequence of 5-second windows
+time_grid <- data.frame(window = seq(from = experiment_start,
+                                     to   = experiment_end,
+                                     by   = "5 sec"))
+
+# --- 2. Bin metrics to 5s ---
+metrics_binned <- metrics_filtered %>%
+  mutate(window = floor_date(now, unit = "5 seconds")) %>%
+  group_by(window) %>%
+  summarise(
+    across(c(cpu.user, mem.used, load.cpucore, load.min1, load.min5, load.min15),
+           list(avg = mean, max = max), .names = "{.col}_{.fn}"),
+    .groups = "drop"
+  )
+
+# --- 3. Bin logs to 5s and normalize log_level ---
+logs_binned <- logs_filtered %>%
+  mutate(
+    window = floor_date(`@timestamp`, unit = "5 seconds"),
+    log_level_upper = toupper(replace_na(log_level, ""))
+  ) %>%
+  group_by(window) %>%
+  summarise(
+    error_count = sum(log_level_upper == "ERROR"),
+    warn_count  = sum(log_level_upper == "WARNING"),
+    .groups = "drop"
+  )
+
+# --- 4. Bin traces to 5s ---
+traces_binned <- traces_filtered %>%
+  mutate(window = floor_date(Timestamp, unit = "5 seconds")) %>%
+  group_by(window) %>%
+  summarise(
+    total_ops   = n(),
+    trace_count = n_distinct(Trace_id),
+    trace_ids   = paste(unique(Trace_id), collapse = ", "),
+    .groups = "drop"
+  )
+
+# --- 5. Full join everything to the time grid ---
+aligned_data <- full_join(metrics_binned, logs_binned, by = "window") %>%
+  full_join(traces_binned, by = "window") %>%
+  mutate(
+    error_count = replace_na(error_count, 0),
+    warn_count  = replace_na(warn_count, 0),
+    total_ops   = replace_na(total_ops, 0),
+    trace_count = replace_na(trace_count, 0),
+    trace_ids   = replace_na(trace_ids, "")
+  )
+
+# Check
+sum(aligned_data$error_count)  # should give 25
+```
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(tidyr)  # for replace_na
+
+# --- Metrics: avg + max per 5s ---
+metrics_binned <- metrics_filtered %>%
+  mutate(window = floor_date(now, unit = "5 seconds")) %>%
+  group_by(window) %>%
+  summarise(
+    across(c(cpu.user, mem.used, load.cpucore, load.min1, load.min5, load.min15),
+           list(avg = mean, max = max), .names = "{.col}_{.fn}"),
+    .groups = "drop"
+  )
+
+# --- Logs: count errors/warnings per 5s ---
+logs_binned <- logs_filtered %>%
+  mutate(
+    window = floor_date(`@timestamp`, unit = "5 seconds"),
+    log_level_upper = toupper(replace_na(log_level, ""))
+  ) %>%
+  group_by(window) %>%
+  summarise(
+    error_count = sum(log_level_upper == "ERROR"),
+    warn_count  = sum(log_level_upper == "WARNING"),
+    .groups = "drop"
+  )
+
+# --- Traces: total + failed ops + trace_ids per 5s ---
+traces_binned <- traces_filtered %>%
+  mutate(window = floor_date(Timestamp, unit = "5 seconds")) %>%
+  group_by(window) %>%
+  summarise(
+    total_ops   = n(),
+    failed_ops  = sum(operation == "FAILED", na.rm = TRUE), # mark failed ops
+    fail_rate   = ifelse(total_ops > 0, failed_ops / total_ops, 0),
+    trace_count = n_distinct(Trace_id),
+    trace_ids   = paste(unique(Trace_id), collapse = ", "),
+    .groups = "drop"
+  )
+
+# --- Full join everything by window ---
+aligned_data <- full_join(metrics_binned, logs_binned, by = "window") %>%
+  full_join(traces_binned, by = "window") %>%
+  mutate(
+    error_count = replace_na(error_count, 0),
+    warn_count  = replace_na(warn_count, 0),
+    total_ops   = replace_na(total_ops, 0),
+    failed_ops  = replace_na(failed_ops, 0),
+    fail_rate   = replace_na(fail_rate, 0),
+    trace_count = replace_na(trace_count, 0),
+    trace_ids   = replace_na(trace_ids, "")
+  )
+
+# Quick check
+sum(aligned_data$error_count)
+sum(aligned_data$failed_ops)
+
+```
+```{r}
+library(dplyr)
+library(lubridate)
+library(tidyr)  # for replace_na
+
+# --- Metrics: avg + max per 5s ---
+metrics_binned <- metrics_filtered %>%
+  mutate(window = floor_date(now, unit = "5 seconds")) %>%
+  group_by(window) %>%
+  summarise(
+    across(c(cpu.user, mem.used, load.cpucore, load.min1, load.min5, load.min15),
+           list(avg = mean, max = max), .names = "{.col}_{.fn}"),
+    .groups = "drop"
+  )
+
+# --- Logs: count errors/warnings per 5s ---
+logs_binned <- logs_filtered %>%
+  mutate(
+    window = floor_date(`@timestamp`, unit = "5 seconds"),
+    log_level_upper = toupper(replace_na(log_level, ""))
+  ) %>%
+  group_by(window) %>%
+  summarise(
+    error_count = sum(log_level_upper == "ERROR"),
+    warn_count  = sum(log_level_upper == "WARNING"),
+    .groups = "drop"
+  )
+
+# --- Traces: count total + failed ops + trace IDs per 5s ---
+traces_binned <- traces_filtered %>%
+  mutate(window = floor_date(Timestamp, unit = "5 seconds")) %>%
+  group_by(window) %>%
+  summarise(
+    total_ops   = n(),
+    trace_count = n_distinct(Trace_id),
+    trace_ids   = paste(unique(Trace_id), collapse = ", "),
+    .groups = "drop"
+  )
+
+# --- Join all three by window ---
+aligned_data <- full_join(metrics_binned, logs_binned, by = "window") %>%
+  full_join(traces_binned, by = "window") %>%
+  mutate(
+    error_count = replace_na(error_count, 0),
+    warn_count  = replace_na(warn_count, 0),
+    total_ops   = replace_na(total_ops, 0),
+    trace_count = replace_na(trace_count, 0),
+    trace_ids   = replace_na(trace_ids, "")
+  )
+
+# Quick checks
+sum(aligned_data$error_count)      # total errors
+sum(aligned_data$warn_count)       # total warnings
+sum(aligned_data$total_ops)        # total trace operations
+
+```
+
+
+
+```{r}
+# Quick check
+head(logs_filtered$request_id)
+head(traces$Trace_id)
+
+```
+
+
+```{r}
+logs_with_trace <- logs_filtered %>%
+  left_join(traces %>% select(Trace_id), by = c("request_id" = "Trace_id"))
+
+```
+
+
+# Do high-level EDA
+
+## Assuming we use the current aligned_data for our analysis
+
+```{r}
+# Print summary statsitics
+summary(aligned_data)
+
+# Print structure of the data
+str(aligned_data)
+
+# Check the columns we have available in the data
+colnames(aligned_data)
+
+# Go through each column and ensure there's a normal distribution and no outliers
+## CPU related columns
+hist(aligned_data$cpu.user_avg)
+hist(aligned_data$cpu.user_max)
+
+## mem related columns
+hist(aligned_data$mem.used_avg)
+hist(aligned_data$mem.used_max)
+
+## Loadrelated columns
+hist(aligned_data$load.cpucore_avg)
+hist(aligned_data$load.cpucore_max)
+hist(aligned_data$load.min1_avg)
+hist(aligned_data$load.min1_max)
+hist(aligned_data$load.min5_avg)
+hist(aligned_data$load.min5_max)
+hist(aligned_data$load.min15_avg)
+hist(aligned_data$load.min15_max)
+
+## Other columns
+hist(aligned_data$error_count)
+hist(aligned_data$warn_count)
+hist(aligned_data$total_ops)
+hist(aligned_data$trace_count)
+```
+
+### how many unique traces are there relative to the total number of operations in each 5-second window?
+
+```{r}
+# Calculate the Ratio of trace_count to total_ops
+
+aligned_data <- aligned_data %>%
+  mutate(
+    trace_op_ratio = trace_count / pmax(total_ops, 1)  # avoid divide-by-zero
+  )
+
+```
+
+
+```{r}
+# Visualise the Trace_op_ratio
+library(ggplot2)
+
+# --- 1. Time series of trace_op_ratio ---
+ggplot(aligned_data, aes(x = window, y = trace_op_ratio)) +
+  geom_line(color = "steelblue") +
+  labs(
+    title = "Trace-to-Operation Ratio Over Time",
+    x = "Time Window",
+    y = "Trace Count / Total Ops"
+  ) +
+  theme_minimal()
+
+# --- 2. Scatter: ratio vs error counts ---
+ggplot(aligned_data, aes(x = trace_op_ratio, y = error_count)) +
+  geom_point(alpha = 0.6, color = "firebrick") +
+  labs(
+    title = "Trace-to-Operation Ratio vs Error Count",
+    x = "Trace Count / Total Ops",
+    y = "Error Count"
+  ) +
+  theme_minimal()
+
+# --- 3. Distribution (histogram/density) ---
+ggplot(aligned_data, aes(x = trace_op_ratio)) +
+  geom_histogram(bins = 50, fill = "darkgreen", color = "white", alpha = 0.7) +
+  labs(
+    title = "Distribution of Trace-to-Operation Ratio",
+    x = "Trace Count / Total Ops",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+```
+
+## Explain the time series visual
+
+What you’re describing suggests that the trace capture (trace_count) is intermittent compared to the total number of operations. Some possible interpretations:
+	•	0 ratios (trace_count / total_ops = 0):
+→ No traces were collected for that time window, even though operations occurred. This could indicate gaps in tracing instrumentation, system overhead dropping spans, or sampling being disabled.
+	•	~0.5 ratios:
+→ Roughly half of the operations are being traced. That might be consistent with a sampling rate of ~50%.
+	•	Long stretches at 0:
+→ This is worth checking against logs or metrics. For example:
+	•	Did errors spike?
+	•	Did CPU/memory utilization increase?
+	•	Did logging warn about dropped spans or buffer overflows?
+	•	Long stretches around 0.5:
+→ That could mean the tracing pipeline was working properly during those times.
+
+
+```{r}
+# Overlay with error counts
+## See if the drop to 0 coincides with spikes in error_count or warn_count.
+
+ggplot(aligned_data, aes(x = window)) +
+  geom_line(aes(y = trace_op_ratio), color = "steelblue") +
+  geom_line(aes(y = error_count / max(error_count, na.rm=TRUE)), 
+            color = "firebrick", linetype = "dashed") +
+  labs(title = "Trace Ratio vs Errors Over Time", y = "Normalized Scale")
+
+```
+
+
+```{r}
+# Overlay with CPU / Memory usage
+## High load could explain why traces weren’t recorded.
+
+ggplot(aligned_data, aes(x = window)) +
+  geom_line(aes(y = trace_op_ratio), color = "steelblue") +
+  geom_line(aes(y = cpu.user_avg / max(cpu.user_avg, na.rm=TRUE)), 
+            color = "darkgreen", linetype = "dashed") +
+  labs(title = "Trace Ratio vs CPU Usage Over Time", y = "Normalized Scale")
+
+```
+	1.	Trace Ratio vs Errors
+	•	You’re seeing the trace ratio dropping to zero at the same times where error spikes appear (like around 21:00 and midnight).
+	•	That suggests the tracing system may have stopped capturing traces exactly when failures happened → a strong signal that trace coverage gaps align with system instability.
+	
+	2.	Trace Ratio vs CPU Usage
+	•	Between 18:00–20:00, CPU usage was fairly steady while the trace ratio fluctuated a lot between 0.5 and 1.
+	•	After 21:00, CPU usage stayed high but trace ratio dropped flat to zero several times → meaning the system was still running but traces weren’t being collected.
+	•	That’s useful for debugging observability gaps: CPU didn’t drop, service was alive, but tracing wasn’t working.
+
+
+```{r}
+# Correlation checks
+#	•	Compute correlations between trace_ratio, CPU, memory, load, error_count, warn_count.
+#	•	This will tell you whether trace coverage gaps systematically align with high CPU, memory, or error bursts.
+
+aligned_data %>%
+  select(trace_op_ratio, cpu.user_avg, mem.used_avg, load.min1_avg, error_count, warn_count) %>%
+  cor(use = "complete.obs")
+
+```
+trace_op_ratio vs warn_count = 0.27
+→ That’s a moderate positive correlation: when more warnings occur, you tend to also see higher trace coverage. Interesting — maybe warnings are captured in traces more reliably than errors.
+trace_op_ratio vs error_count ≈ 0.00
+→ Almost no correlation. Errors don’t seem to systematically appear in windows with high/low trace coverage. That matches your earlier observation: sometimes trace coverage drops out completely, but errors still spike.
+trace_op_ratio vs load.min1_avg = 0.20
+→ Slightly positive. Trace coverage tends to be higher when load is higher (counterintuitive — maybe instrumentation works better when services are actively busy?).
+cpu.user_avg vs load.min1_avg = 0.69
+→ Very strong correlation (expected — load avg and CPU usage go hand in hand).
+mem.used_avg correlations are weak or negative
+→ Memory usage doesn’t seem tied to trace coverage, CPU, or errors.
+
+
+
+```{r}
+# Event segmentation
+#	•	Mark intervals where trace_ratio == 0.
+#	•	Compare average CPU, errors, and warnings inside those intervals vs outside.
+
+aligned_data %>%
+  mutate(trace_gap = trace_op_ratio == 0) %>%
+  group_by(trace_gap) %>%
+  summarise(across(c(cpu.user_avg, mem.used_avg, error_count, warn_count), mean, na.rm = TRUE))
+
+```
+•	Split windows into two groups:
+	•	trace_op_ratio == 0 (gaps)
+	•	trace_op_ratio > 0 (coverage)
+	•	Compare averages of cpu.user_avg, error_count, warn_count.
+	
+
+Key observations:
+CPU usage barely changes
+~17.6 vs ~17.4 → tracing on/off doesn’t meaningfully affect CPU.
+Memory slightly higher when tracing is OFF
+4.36e9 vs 4.43e9 → a tiny increase, but probably noise unless consistent across runs.
+Error rates are the same (even a bit higher during trace gaps)
+0.0037 vs 0.0042 → suggests tracing doesn’t influence system failures.
+Warnings drop massively when tracing is OFF 🚨
+0.79 → 0.10 → That’s ~8× fewer warnings recorded when tracing is missing.
+This implies instrumentation loss: warnings aren’t being captured reliably when traces disappear.
+
+
+```{r}
+# Time-lag relationship
+#	•	Run a cross-correlation function (CCF) between trace_op_ratio and error_count or warn_count to see if warnings/errors tend to lead or lag tracing gaps.
+
+ccf(aligned_data$trace_op_ratio, aligned_data$warn_count, na.action = na.omit)
+
+```
+
+1. What the ACF Plot Shows
+
+	•	The ACF measures how much two signals are correlated when one is shifted (lagged) in time relative to the other.
+	•	The bars represent correlation at different lags.
+	•	The blue dashed lines are the significance bounds — values outside these lines indicate statistically significant correlation.
+	
+	2. What We See in Your Plot
+
+	•	Every lag has a small but consistently positive correlation (~0.2).
+	•	The correlation is stable across all lags (no strong spikes at particular shifts).
+	•	Importantly, the values are well above the significance threshold, so the relationship is not random.
+	
+	3. Context With the Rest of Your Analysis
+
+	•	Earlier, you found that:
+	•	trace_op_ratio has a moderate positive correlation (0.27) with warn_count.
+	•	It showed little correlation with errors and only weak correlation with CPU/memory.
+	•	The time series visualization showed that trace_op_ratio goes to 0 during gaps, while warnings fluctuate at those same periods.
+	•	Now, this ACF confirms that the relationship between trace coverage and warnings is persistent over time, not just at one specific moment.
+	
+	4. Interpretation
+
+	•	When traces drop (gaps, ratio → 0), warnings also tend to reduce.
+	•	When trace ratio recovers (≈0.5), warnings rise again.
+	•	This suggests warnings are more likely when trace coverage is higher, perhaps because:
+	•	More traced operations → more chances to capture warnings.
+	•	Trace sampling (or loss) is biasing your ability to observe warnings.
+	•	Or the system itself emits warnings during load phases that also align with higher tracing coverage.
+	
+	
+	Key takeaway:
+The ACF analysis reinforces your earlier finding that trace coverage (trace_op_ratio) and warnings are tied together in a consistent, lag-independent way. Unlike errors (which were random and sparse), warnings are structurally linked with tracing visibility.
+
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+aligned_minute <- aligned_data %>%
+  mutate(minute = floor_date(window, "minute")) %>%
+  group_by(minute) %>%
+  summarise(
+    cpu = mean(cpu.user_avg, na.rm = TRUE),
+    mem = mean(mem.used_avg, na.rm = TRUE),
+    load1 = mean(load.min1_avg, na.rm = TRUE),
+    log_count = sum(error_count + warn_count, na.rm = TRUE),
+    warn_count = sum(warn_count, na.rm = TRUE),
+    error_count = sum(error_count, na.rm = TRUE),
+    trace_count = sum(trace_count, na.rm = TRUE),
+    total_ops = sum(total_ops, na.rm = TRUE)
+  ) %>%
+  arrange(minute)
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(aligned_minute, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count), color = "Logs")) +
+  geom_line(aes(y = scale(cpu), color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  labs(title = "Overlay Time Series: Logs, CPU, Traces (Per Minute)",
+       y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green")) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(aligned_minute, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count), color = "Logs")) +
+  geom_line(aes(y = scale(cpu), color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  geom_line(aes(y = scale(warn_count), color = "Warnings"), linetype = "dashed") +
+  geom_line(aes(y = scale(error_count), color = "Errors"), linetype = "dotted") +
+  labs(title = "Overlay Time Series with Warnings & Errors",
+       y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c(
+    "Logs" = "blue", "CPU" = "red", "Traces" = "green",
+    "Warnings" = "orange", "Errors" = "black"
+  )) +
+  theme_minimal()
+```
+
+```{r}
+report_events <- reports %>%
+  select(subtask_title, subtask_created_at, subtask_updated_at)
+
+ggplot(aligned_minute, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count), color = "Logs")) +
+  geom_line(aes(y = scale(cpu), color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  geom_rect(data = report_events,
+            aes(xmin = subtask_created_at, xmax = subtask_updated_at,
+                ymin = -Inf, ymax = Inf, fill = subtask_title),
+            alpha = 0.2, inherit.aes = FALSE) +
+  labs(title = "Overlay with External Report Events",
+       y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green")) +
+  theme_minimal()
+```
+
+
+```{r}
+library(dplyr)
+
+corr_data <- aligned_minute %>%
+  select(cpu, mem, load1,
+         log_count, warn_count, error_count,
+         trace_count, total_ops) %>%
+  na.omit()
+```
+
+```{r}
+corr_matrix <- cor(corr_data, use = "complete.obs")
+print(round(corr_matrix, 2))
+```
+
+```{r}
+library(ggplot2)
+library(reshape2)
+
+melted_corr <- melt(corr_matrix)
+
+ggplot(melted_corr, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+                       midpoint = 0, limit = c(-1,1), space = "Lab",
+                       name = "Correlation") +
+  geom_text(aes(label = round(value, 2)), color = "black", size = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1,
+                                   size = 10, hjust = 1)) +
+  labs(title = "Correlation Matrix: Logs, Metrics, Traces (Per Minute)",
+       x = "", y = "")
+```
+
+```{r}
+# Logs vs CPU
+ccf(aligned_minute$log_count, aligned_minute$cpu, na.action = na.omit,
+    main = "Cross-Correlation: Log Count vs CPU")
+
+# Traces vs CPU
+ccf(aligned_minute$trace_count, aligned_minute$cpu, na.action = na.omit,
+    main = "Cross-Correlation: Trace Count vs CPU")
+
+# Errors vs Traces
+ccf(aligned_minute$error_count, aligned_minute$trace_count, na.action = na.omit,
+    main = "Cross-Correlation: Errors vs Traces")
+```
+
+
+
+```{r}
+# install.packages("GGally")
+library(GGally)
+
+ggpairs(corr_data,
+        columns = 1:6,  # adjust range to cover features you want
+        title = "Pairwise Scatterplots: Logs, Metrics, Traces")
+```
+
+
+```{r}
+library(ggplot2)
+
+ggplot(aligned_minute, aes(x = cpu, y = log_count)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "CPU vs Log Count", x = "CPU (avg)", y = "Log Count")
+```
+
+## Add Labels to aligned_minute
+
+```{r}
+aligned_labeled <- aligned_minute %>%
+  mutate(
+    # Rule 1: anomaly if errors or warnings present
+    log_anomaly = ifelse(error_count > 0 | warn_count > 0, 1, 0),
+
+    # Rule 2: anomaly if CPU, memory, or load are high
+    metric_anomaly = ifelse(cpu > 80 | mem > 90 | load1 > 10, 1, 0),
+
+    # Rule 3: anomaly if unusual trace activity (low or high)
+    trace_anomaly = ifelse(trace_count == 0 | trace_count > quantile(trace_count, 0.95, na.rm = TRUE), 1, 0),
+
+    # Final combined label (strict = must satisfy multiple, loose = any condition)
+    anomaly_label_strict = ifelse(log_anomaly == 1 & metric_anomaly == 1 & trace_anomaly == 1, 1, 0),
+    anomaly_label_loose  = ifelse(log_anomaly == 1 | metric_anomaly == 1 | trace_anomaly == 1, 1, 0)
+  )
+```
+
+
+```{r}
+# Check Label Distribution
+table(aligned_labeled$anomaly_label_strict)
+table(aligned_labeled$anomaly_label_loose)
+```
+
+Strict labels (anomaly_label_strict): Balanced enough for training — you’ve got anomalies clearly marked, but not overwhelming.
+
+Loose labels (anomaly_label_loose): Every single window is flagged anomalous (!), which makes it useless for classification — no contrast with normal behavior.
+
+What This Means
+
+	•	Your strict definition is the usable one for model training (transformer or other classifier).
+	•	The loose definition is too permissive, since warn/error counts or trace spikes are nearly always happening.
+	•	You may want to refine the strict rules a little (e.g., require sustained anomalies across consecutive windows, or increase thresholds for CPU/mem/load) if you find too many false positives.
+	
+
+```{r}
+aligned_labeled <- aligned_labeled %>%
+  mutate(
+    anomaly_label_loose = ifelse(
+      (cpu > mean(cpu, na.rm = TRUE) + 2*sd(cpu, na.rm = TRUE)) |
+      (mem > mean(mem, na.rm = TRUE) + 2*sd(mem, na.rm = TRUE)) |
+      (warn_count > 0),
+      1, 0
+    )
+  )
+```
+
+```{r}
+table(aligned_labeled$anomaly_label_loose)
+```
+
+```{r}
+aligned_labeled <- aligned_labeled %>%
+  mutate(
+    anomaly_label_loose = ifelse(
+      (cpu > mean(cpu, na.rm = TRUE) + 2*sd(cpu, na.rm = TRUE)) |      # CPU spike
+      (mem > mean(mem, na.rm = TRUE) + 2*sd(mem, na.rm = TRUE)) |      # Memory spike
+      (load1 > mean(load1, na.rm = TRUE) + 2*sd(load1, na.rm = TRUE)) |# System load spike
+      (log_count > mean(log_count, na.rm = TRUE) + 2*sd(log_count, na.rm = TRUE)) | # Log burst
+      (warn_count > 0),                                                # Any warnings
+      1, 0
+    )
+  )
+```
+
+
+```{r}
+table(aligned_labeled$anomaly_label_loose)
+```
+
+what the new loose anomaly definition means in plain English:
+
+We mark a time window as an anomaly if any one of the following unusual events happens:
+	1.	CPU spike → CPU usage is much higher than normal (more than 2 standard deviations above its average).
+	2.	Memory spike → Memory usage is much higher than normal (same 2σ rule).
+	3.	System load spike → The system load (load1) is much higher than normal.
+	4.	Log burst → The number of logs jumps far above its usual level.
+	5.	Warnings → Any warning logs are present.
+	
+	
+So in short:
+
+	A loose anomaly is any single unusual spike or warning, even if the other systems look fine.
+
+This contrasts with your strict anomalies, which require multiple conditions lining up together (errors + high load + trace anomalies).
+
+
+
+```{r}
+# Visualize Anomalies on the Time Series
+ggplot(aligned_labeled, aes(x = minute)) +
+  geom_line(aes(y = scale(cpu), color = "CPU")) +
+  geom_line(aes(y = scale(log_count), color = "Logs")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  geom_point(aes(y = 0, shape = factor(anomaly_label_loose)), size = 3, color = "red") +
+  labs(title = "Overlay with Anomaly Labels (Loose Definition)",
+       y = "Scaled values", x = "Time", shape = "Anomaly") +
+  scale_color_manual(values = c("CPU" = "red", "Logs" = "blue", "Traces" = "green")) +
+  theme_minimal()
+```
+
+## Handle missingness
+
+  •	Counts (logs, warnings, errors, traces) → fill missing with 0.
+	•	Metrics (cpu, mem, load1) → forward-fill, or interpolate if gaps are small.
+	•	Labels → If inputs are filled, labels remain valid (since anomaly detection rules still apply).
+
+```{r}
+library(dplyr)
+library(zoo)
+
+aligned_clean <- aligned_labeled %>%
+  mutate(
+    # Replace NAs in counts with zero
+    across(c(log_count, warn_count, error_count, trace_count, total_ops),
+           ~replace_na(., 0)),
+    
+    # Fill metrics with last known value (carry forward)
+    cpu   = na.locf(cpu, na.rm = FALSE),
+    mem   = na.locf(mem, na.rm = FALSE),
+    load1 = na.locf(load1, na.rm = FALSE)
+  )
+```
+
+```{r}
+colSums(is.na(aligned_clean))
+```
+what your NA distribution means:
+	•	cpu, mem, load1 → each has 60 missing values
+→ That’s your metric data not reporting in those minutes.
+	•	anomaly_label_loose → also 60 missing values
+→ Makes sense, since the loose rule depends on cpu, mem, and load1. When those were NA, the label couldn’t be computed.
+	•	Everything else (log_count, warn_count, error_count, trace_count, strict labels, etc.) is clean. 🎉
+	
+	
+	What this implies
+
+	•	Those 60 rows are incomplete but not unusable.
+	•	If you drop them, you’ll lose 60 minutes of data.
+	•	If you impute them, you’ll keep the full timeline — better for a sequential model like a transformer.
+	
+	
+	
+```{r}
+# Forward-fill (recommended for metrics)
+#	•	Replace missing metric values (cpu, mem, load1) with the last observed value.
+#	•	Then recompute anomaly_label_loose so those 60 labels aren’t NA anymore.
+
+library(zoo)
+
+aligned_clean <- aligned_labeled %>%
+  mutate(
+    cpu   = na.locf(cpu, na.rm = FALSE, fromLast = FALSE),  # forward
+    cpu   = na.locf(cpu, na.rm = FALSE, fromLast = TRUE),   # backward
+    mem   = na.locf(mem, na.rm = FALSE, fromLast = FALSE),
+    mem   = na.locf(mem, na.rm = FALSE, fromLast = TRUE),
+    load1 = na.locf(load1, na.rm = FALSE, fromLast = FALSE),
+    load1 = na.locf(load1, na.rm = FALSE, fromLast = TRUE)
+  ) %>%
+  mutate(
+    anomaly_label_loose = ifelse(
+      (cpu > mean(cpu, na.rm = TRUE) + 2*sd(cpu, na.rm = TRUE)) |
+      (mem > mean(mem, na.rm = TRUE) + 2*sd(mem, na.rm = TRUE)) |
+      (load1 > mean(load1, na.rm = TRUE) + 2*sd(load1, na.rm = TRUE)) |
+      (log_count > mean(log_count, na.rm = TRUE) + 2*sd(log_count, na.rm = TRUE)) |
+      (warn_count > 0),
+      1, 0
+    )
+  )
+```
+	
+	
+Perfect 👍 — now all your input features are filled (no more NAs in cpu, mem, load1, logs, traces, etc.).
+
+The only column still showing 60 NAs is metric_anomaly, which makes sense because that column was derived before you fixed the metric gaps.
+
+```{r}
+# fix metric_anomaly
+# Recalculate it after filling - Just like you did with anomaly_label_loose, recompute it using the cleaned metric values:
+
+aligned_clean <- aligned_clean %>%
+  mutate(
+    metric_anomaly = ifelse(
+      (cpu > mean(cpu, na.rm = TRUE) + 2*sd(cpu, na.rm = TRUE)) |
+      (mem > mean(mem, na.rm = TRUE) + 2*sd(mem, na.rm = TRUE)) |
+      (load1 > mean(load1, na.rm = TRUE) + 2*sd(load1, na.rm = TRUE)),
+      1, 0
+    )
+  )
+```
+
+# ----------------------------------------------
+
+# Train classifiers to identify anomolies
+
+Why the Cross-Dataset Attention Transformer is powerful
+
+	•	Its strength comes from learning relationships across modalities (logs ↔ metrics ↔ traces), while letting each stream keep its own structure.
+	•	You don’t have to squash everything into one table; the model can take parallel inputs.
+	•	Example:
+	•	Branch 1 → raw logs (or embeddings of log_level + text).
+	•	Branch 2 → continuous metrics sequence.
+	•	Branch 3 → trace events / spans.
+	•	Attention layers learn which modality is most predictive at each time.
+
+That way, you avoid heavy imputation and don’t lose modality-specific signals.
+
+
+What happens when you align into one dataset (like you did)
+
+	•	Simpler, but you flatten very different signals into one timeline.
+	•	Requires a lot of imputation (esp. for logs/traces when nothing happened in a window).
+	•	You lose modality-specific temporal structure (e.g., exact trace span sequences).
+	•	You can still train ML models (RF, XGBoost, etc.), but you’re really testing whether your aggregated features are enough.
+	
+	
+	Random Forest sanity check
+
+	•	Great idea as a sanity check ✅
+	•	It doesn’t assume temporal order or modality separation.
+	•	If RF can classify anomalies with reasonable accuracy, then you know your labels + features make sense.
+	•	But it won’t capture cross-modality temporal dependencies the way a transformer could.
+	
+	
+	trategic choice
+
+	•	If your goal is end-to-end anomaly detection research, it’s worth training the transformer with the separate datasets (logs, metrics, traces as streams).
+	•	If your goal is quick validation, use RF on the aligned dataset you already built.
+	
+```{r}
+library(randomForest)
+library(dplyr)
+
+set.seed(42)
+
+# Use loose labels for now
+rf_data <- aligned_clean %>%
+  select(cpu, mem, load1, log_count, warn_count, error_count, trace_count, total_ops, anomaly_label_loose)
+
+# Train/test split
+train_idx <- sample(1:nrow(rf_data), size = 0.7 * nrow(rf_data))
+train_data <- rf_data[train_idx, ]
+test_data  <- rf_data[-train_idx, ]
+
+# Train Random Forest
+rf_model <- randomForest(
+  factor(anomaly_label_loose) ~ .,
+  data = train_data,
+  ntree = 500,
+  mtry = 3,
+  importance = TRUE
+)
+
+# Evaluate
+preds <- predict(rf_model, newdata = test_data)
+conf_mat <- table(Predicted = preds, Actual = test_data$anomaly_label_loose)
+
+print(conf_mat)
+cat("\nAccuracy:", mean(preds == test_data$anomaly_label_loose), "\n")
+
+# Variable importance
+importance(rf_model)
+varImpPlot(rf_model)
+```
+
+
+The RF predicted all anomalies and all normal windows perfectly (100% accuracy).
+
+	•	Accuracy: 1 (perfect).
+	•	In practice, this suggests your anomaly labels are very strongly separable from the features.
+	•	It could also mean the labels are a bit trivially defined (e.g., warnings → anomaly), which RF can pick up instantly.
+	•	Variable importance
+	•	Top features: warn_count, log_count, trace_count, and total_ops.
+	•	Moderate influence: cpu.
+	•	Low influence: mem, load1, error_count.
+	•	Interpretation: your anomalies are mostly being driven by logs + traces, not so much by CPU/memory.
+	
+	
+	Things to watch out for
+
+	1.	Too clean separation: If accuracy is too high, the task might be too easy because the anomaly definition is simple (e.g., “if warn_count > 0 → anomaly”). That means the RF is validating the logic of your labels, not really discovering new anomaly patterns.
+	2.	Data leakage risk: If your loose label definition directly includes features like warn_count, then of course RF will just pick that up.
+	3.	Still useful: This proves your pipeline is solid: data aligned, labels coherent, features consistent. You’ve got a good baseline.
+	
+	
+	
+	100% accuracy suggests the model basically memorized your label logic (especially since warn_count is baked directly into anomaly_label_loose).
+
+To make the sanity check more realistic, you can reduce the size of the training set (so the model sees less data and generalizes more), or you can balance the classes so the task is less trivial.
+
+
+```{r}
+# reduce the training set 
+set.seed(42)
+
+# Smaller train/test split (e.g., 30% train, 70% test)
+train_idx <- sample(1:nrow(rf_data), size = 0.3 * nrow(rf_data))
+train_data <- rf_data[train_idx, ]
+test_data  <- rf_data[-train_idx, ]
+
+rf_model_small <- randomForest(
+  factor(anomaly_label_loose) ~ .,
+  data = train_data,
+  ntree = 500,
+  mtry = 3,
+  importance = TRUE
+)
+
+preds_small <- predict(rf_model_small, newdata = test_data)
+conf_mat_small <- table(Predicted = preds_small, Actual = test_data$anomaly_label_loose)
+
+print(conf_mat_small)
+cat("\nAccuracy:", mean(preds_small == test_data$anomaly_label_loose), "\n")
+```
+
+maller training split → accuracy dropped slightly to 98.4%.
+	•	The model generalizes very well.
+	•	Only 6 anomalies misclassified out of ~374 samples.
+	•	Still very strong separation.
+
+
+
+```{r}
+# Downsample the majority class
+
+# If anomalies (label 1) are too tightly linked with warn_count, you can balance classes to make the model work harder:
+  
+library(caret)
+
+set.seed(42)
+
+# Balance classes (random downsampling)
+balanced_idx <- downSample(
+  x = rf_data %>% select(-anomaly_label_loose),
+  y = factor(rf_data$anomaly_label_loose)
+)
+
+balanced_data <- cbind(balanced_idx[, -ncol(balanced_idx)], anomaly_label_loose = balanced_idx$Class)
+
+train_idx <- sample(1:nrow(balanced_data), size = 0.7 * nrow(balanced_data))
+train_data <- balanced_data[train_idx, ]
+test_data  <- balanced_data[-train_idx, ]
+
+rf_model_bal <- randomForest(
+  factor(anomaly_label_loose) ~ .,
+  data = train_data,
+  ntree = 500,
+  mtry = 3,
+  importance = TRUE
+)
+
+preds_bal <- predict(rf_model_bal, newdata = test_data)
+conf_mat_bal <- table(Predicted = preds_bal, Actual = test_data$anomaly_label_loose)
+
+print(conf_mat_bal)
+cat("\nAccuracy:", mean(preds_bal == test_data$anomaly_label_loose), "\n")
+```
+
+Balanced classes → back to 100% accuracy.
+	•	Suggests that the anomaly label (anomaly_label_loose) is almost a deterministic function of features like warn_count or log_count.
+	•	The model doesn’t have to “discover” anything—your label logic is already in the data.
+	
+
+
+Interpretation
+
+	•	Good news: Your preprocessing + labeling is consistent. The features and labels align perfectly.
+	•	Limitation: For a more challenging ML task, the label needs to be less trivial. Right now, any model can “cheat” by looking at warn_count or log_count.
+	
+	
+	
+Next move
+
+If you want the transformer (or any model) to actually learn cross-dataset interactions instead of re-learning your rule, you’ll need to:
+	1.	Define anomalies with stricter rules
+	•	E.g., require combined conditions: CPU > threshold AND traces > threshold AND warnings present.
+	•	This way, anomalies aren’t detectable from a single feature.
+	2.	Use strict labels instead of loose ones
+	•	Your anomaly_label_strict already requires multiple signals (errors + load + traces).
+	•	This should make the classification less trivial.
+	3.	Optionally, drop trivial features when training
+	•	For example, remove warn_count or log_count from the feature set if they are too directly tied to the label definition.
+	•	Then the model has to rely on metrics + traces.
+
+
+```{r}
+# switch to strict labels - makes the classification problem less trivial and much more meaningful
+
+set.seed(42)
+
+# Use strict labels this time
+rf_data_strict <- aligned_clean %>%
+  select(cpu, mem, load1, log_count, warn_count, error_count, trace_count, total_ops, anomaly_label_strict)
+
+# Train/test split
+train_idx <- sample(1:nrow(rf_data_strict), size = 0.7 * nrow(rf_data_strict))
+train_data <- rf_data_strict[train_idx, ]
+test_data  <- rf_data_strict[-train_idx, ]
+
+# Train Random Forest
+rf_model_strict <- randomForest(
+  factor(anomaly_label_strict) ~ .,
+  data = train_data,
+  ntree = 500,
+  mtry = 3,
+  importance = TRUE
+)
+
+# Evaluate
+preds_strict <- predict(rf_model_strict, newdata = test_data)
+conf_mat_strict <- table(Predicted = preds_strict, Actual = test_data$anomaly_label_strict)
+
+print(conf_mat_strict)
+cat("\nAccuracy:", mean(preds_strict == test_data$anomaly_label_strict), "\n")
+
+# Variable importance
+importance(rf_model_strict)
+varImpPlot(rf_model_strict)
+```
+
+strict-label RF sanity check shows:
+	•	Accuracy: ~96% → much more realistic than 100%. The task isn’t trivial anymore.
+	•	Confusion matrix:
+	•	141 normal correctly classified, 6 strict anomalies missed.
+	•	13 anomalies correctly detected, 0 false positives.
+→ So it’s slightly conservative (leans toward predicting “normal”), but that’s expected with strict labels.
+	•	Feature importance:
+	•	trace_count and total_ops are dominant features (highest MeanDecreaseAccuracy/Gini).
+	•	warn_count and log_count are still strong, but less overwhelming compared to the loose-label version.
+	•	cpu, mem, load1 actually show up as useful — meaning the model is now picking up signal from system metrics.
+	•	error_count barely helps (low importance, even negative for class 1).
+	
+	
+	
+	Takeaways:
+	1.	The strict labels did their job — the model is challenged and starts using metrics and traces.
+	2.	Random Forest can still classify with decent accuracy (~96%), meaning the labels are internally consistent.
+	3.	We can now justify moving on to the cross-dataset transformer, where the real benefit comes (less imputation, therefore fewer distributional differences).
+	
+	
+### Evaluate and visualise the strict label RF sanity check
+
+
+```{r}
+library(caret)
+
+# Confusion matrix with stats
+confusionMatrix(preds_strict, factor(test_data$anomaly_label_strict))
+```
+
+```{r}
+library(pROC)
+
+# Get probabilities for ROC curve
+probs_strict <- predict(rf_model_strict, newdata = test_data, type = "prob")[,2]
+
+roc_obj <- roc(test_data$anomaly_label_strict, probs_strict)
+plot(roc_obj, main = "ROC Curve - RF Strict Labels")
+auc(roc_obj)
+```
+
+
+```{r}
+library(ggplot2)
+
+imp <- importance(rf_model_strict)
+imp_df <- data.frame(
+  Feature = rownames(imp),
+  MeanDecreaseAccuracy = imp[, "MeanDecreaseAccuracy"]
+)
+
+ggplot(imp_df, aes(x = reorder(Feature, MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance (RF - Strict Labels)",
+       x = "Feature", y = "Mean Decrease Accuracy")
+```
+
+```{r}
+results <- test_data %>%
+  mutate(
+    Predicted = as.numeric(as.character(preds_strict)),
+    Actual = anomaly_label_strict
+  ) %>%
+  bind_cols(minute = aligned_clean$minute[-train_idx])  # align with timestamps
+
+ggplot(results, aes(x = minute)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Predicted, color = "Predicted"), linetype = "dashed") +
+  labs(title = "RF Predictions vs Actual Strict Anomalies",
+       y = "Anomaly Label", x = "Time") +
+  scale_color_manual(values = c("Actual" = "red", "Predicted" = "blue"))
+```
+
+
+```{r}
+results <- test_data %>%
+  mutate(
+    Predicted = as.numeric(as.character(preds_strict)),
+    Actual = anomaly_label_strict
+  ) %>%
+  bind_cols(minute = aligned_clean$minute[-train_idx])
+
+ggplot(results, aes(x = minute)) +
+  geom_point(aes(y = Actual, color = "Actual"), size = 2, shape = 16) +
+  geom_point(aes(y = Predicted, color = "Predicted"), size = 2, shape = 1) +
+  labs(title = "RF Predictions vs Actual Strict Anomalies (Event View)",
+       y = "Anomaly (0=Normal, 1=Anomaly)", x = "Time") +
+  scale_color_manual(values = c("Actual" = "red", "Predicted" = "blue"))
+```
+
+
+
+```{r}
+library(ggplot2)
+
+conf_mat_df <- as.data.frame(conf_mat_strict)
+colnames(conf_mat_df) <- c("Predicted", "Actual", "Freq")
+
+ggplot(conf_mat_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 6) +
+  scale_fill_gradient(low = "steelblue", high = "darkred") +
+  labs(title = "Confusion Matrix (RF - Strict Labels)")
+```
+
+
+## Key Takeaways
+
+What worked
+
+	1.	Labels are consistent and learnable
+	•	The model achieved ~96% accuracy.
+	•	Anomalies aren’t random noise — they correspond to clear signals in the data.
+	2.	Strict labels are less trivial than loose labels
+	•	With loose labels, warn_count and log_count dominated → trivial separation, 100% accuracy.
+	•	With strict labels, the model had to use traces, ops, CPU, mem too → much more realistic anomaly definition.
+	3.	Logs & traces dominate, but metrics matter
+	•	Feature importance: trace_count, total_ops, and log-based counts were strongest.
+	•	But CPU, mem, load1 also contributed, which means anomalies aren’t just log-driven.
+
+
+Limitations
+
+	1.	Model still conservative
+	•	It detected 13/19 strict anomalies (missed 6).
+	•	No false positives → so it’s biased toward “normal” unless signals are strong.
+	2.	Labels partly reflect input features
+	•	Even strict labels overlap with features like trace_count.
+	•	Some risk of “teaching the model its own definition,” rather than learning deeper causal patterns.
+	3.	Random Forest is only a shallow check
+	•	It treats everything tabular, ignores sequence order and cross-dataset interactions.
+	•	Useful for sanity, but not for the real goal: modeling interactions between logs, metrics, and traces.
+	
+	
+	
+	
+
+
+
+# ------------------------------------------------------------------------------
+
+# Making visuals interactive
+
+```{r}
+# Distribution of log levels
+p <- logs_filtered %>%
+  count(log_level, sort = TRUE) %>%
+  ggplot(aes(x = reorder(log_level, n), y = n, text = paste("Level:", log_level, "<br>Count:", n))) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Log Level Distribution", x = "Log Level", y = "Count")
+ggI(p)
+
+# HTTP status distribution (ignoring NAs)
+p <- logs_filtered %>%
+  filter(!is.na(http_status)) %>%
+  count(http_status) %>%
+  ggplot(aes(x = http_status, y = n, text = paste("Status:", http_status, "<br>Count:", n))) +
+  geom_col() +
+  labs(title = "HTTP Status Codes", x = "Status Code", y = "Count")
+ggI(p)
+
+# Logs over time
+p <- logs_filtered %>%
+  mutate(minute = lubridate::floor_date(`@timestamp`, "minute")) %>%
+  count(minute) %>%
+  ggplot(aes(x = minute, y = n, text = paste("Time:", minute, "<br>Logs/min:", n))) +
+  geom_line() +
+  labs(title = "Log Volume Over Time", x = "Time", y = "Logs per Minute")
+ggI(p)
+
+```
+
+```{r}
+# CPU distribution
+p <- ggplot(metrics_filtered, aes(x = cpu.user, text = paste("CPU %:", round(cpu.user,2)))) +
+  geom_histogram(bins = 50) +
+  labs(title = "CPU Usage Distribution", x = "CPU %", y = "Count")
+ggI(p)
+
+# Memory usage distribution (GB)
+p <- ggplot(metrics_filtered, aes(x = mem.used/1e9, text = paste("Mem (GB):", round(mem.used/1e9,2)))) +
+  geom_histogram(bins = 50) +
+  labs(title = "Memory Usage Distribution", x = "Memory (GB)", y = "Count")
+ggI(p)
+
+# Time series: CPU usage
+p <- metrics_filtered %>%
+  mutate(minute = lubridate::floor_date(now, "minute")) %>%
+  group_by(minute) %>%
+  summarise(cpu_avg = mean(cpu.user, na.rm = TRUE), .groups="drop") %>%
+  ggplot(aes(x = minute, y = cpu_avg, text = paste("Time:", minute, "<br>CPU avg:", round(cpu_avg,2)))) +
+  geom_line() +
+  labs(title = "Average CPU Usage Over Time", x = "Time", y = "CPU %")
+ggI(p)
+
+# Correlation heatmap (Plotly)
+metrics_num <- metrics_filtered %>% select(cpu.user, mem.used, load.min1, load.min5, load.min15)
+cor_mat <- cor(metrics_num, use = "pairwise.complete.obs")
+plot_ly(
+  x = colnames(cor_mat),
+  y = colnames(cor_mat),
+  z = cor_mat,
+  type = "heatmap",
+  colors = vir
+) %>% layout(title = "Correlation Heatmap of Metrics")
+
+```
+
+```{r}
+# Top operations
+top_ops <- traces_filtered %>%
+  count(operation, sort = TRUE) %>%
+  slice_head(n = 15)
+datatable(top_ops, options = list(pageLength = 15), rownames = FALSE)
+
+# Count by project
+proj_counts <- traces_filtered %>%
+  count(Project, sort = TRUE)
+datatable(proj_counts, options = list(pageLength = 10), rownames = FALSE)
+
+# Trace events over time
+p <- traces_filtered %>%
+  mutate(minute = lubridate::floor_date(Timestamp, "minute")) %>%
+  count(minute) %>%
+  ggplot(aes(x = minute, y = n, text = paste("Time:", minute, "<br>Traces:", n))) +
+  geom_line() +
+  labs(title = "Trace Events Over Time", x = "Time", y = "Count")
+ggI(p)
+
+```
+
+```{r}
+traces_by_op <- traces %>%
+  mutate(minute = lubridate::floor_date(Timestamp, "minute")) %>%
+  group_by(minute, operation) %>%
+  summarise(trace_count = n(), .groups="drop")
+
+p <- ggplot(traces_by_op, aes(x = minute, y = trace_count, color = operation,
+                              text = paste("Time:", minute, "<br>Op:", operation, "<br>Count:", trace_count))) +
+  geom_line() +
+  labs(title = "Trace Volume by Operation", x = "Time", y = "Trace Count")
+ggI(p)
+
+```
+
+```{r}
+report_events <- reports %>%
+  select(subtask_title, subtask_created_at, subtask_updated_at)
+
+p <- ggplot(overlay, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count), color = "Logs")) +
+  geom_line(aes(y = scale(cpu), color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  geom_rect(
+    data = report_events,
+    aes(xmin = subtask_created_at, xmax = subtask_updated_at,
+        ymin = -Inf, ymax = Inf, fill = subtask_title),
+    alpha = 0.2, inherit.aes = FALSE
+  ) +
+  labs(title = "Overlay with External Report Events", y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green"))
+ggI(p)
+
+```
+
+
+```{r}
+plot_ly(x = ~aligned_data$cpu.user_avg, type = "histogram", nbinsx = 50) %>% 
+  layout(title = "cpu.user_avg")
+
+plot_ly(x = ~aligned_data$mem.used_avg, type = "histogram", nbinsx = 50) %>% 
+  layout(title = "mem.used_avg")
+
+# repeat similarly for the other columns…
+
+```
+
+```{r}
+# 1) Time series
+p <- ggplot(aligned_data, aes(x = window, y = trace_op_ratio,
+                              text = paste("Window:", window, "<br>Ratio:", round(trace_op_ratio,3)))) +
+  geom_line() +
+  labs(title = "Trace-to-Operation Ratio Over Time", x = "Time Window", y = "Trace Count / Total Ops") +
+  theme_minimal()
+ggI(p)
+
+# 2) Scatter vs errors
+p <- ggplot(aligned_data, aes(x = trace_op_ratio, y = error_count,
+                              text = paste("Ratio:", round(trace_op_ratio,3), "<br>Errors:", error_count))) +
+  geom_point(alpha = 0.6) +
+  labs(title = "Trace-to-Operation Ratio vs Error Count", x = "Trace Count / Total Ops", y = "Error Count")
+ggI(p)
+
+# 3) Distribution
+p <- ggplot(aligned_data, aes(x = trace_op_ratio, text = paste("Ratio:", round(trace_op_ratio,3)))) +
+  geom_histogram(bins = 50) +
+  labs(title = "Distribution of Trace-to-Operation Ratio", x = "Trace Count / Total Ops", y = "Frequency")
+ggI(p)
+
+# Overlays with errors and CPU (normalized)
+norm_err <- max(aligned_data$error_count, na.rm=TRUE)
+norm_cpu <- max(aligned_data$cpu.user_avg, na.rm=TRUE)
+
+p <- ggplot(aligned_data, aes(x = window)) +
+  geom_line(aes(y = trace_op_ratio, color = "Trace Ratio")) +
+  geom_line(aes(y = error_count / norm_err, color = "Errors (norm)")) +
+  labs(title = "Trace Ratio vs Errors Over Time", y = "Value", x = "Time")
+ggI(p)
+
+p <- ggplot(aligned_data, aes(x = window)) +
+  geom_line(aes(y = trace_op_ratio, color = "Trace Ratio")) +
+  geom_line(aes(y = cpu.user_avg / norm_cpu, color = "CPU (norm)")) +
+  labs(title = "Trace Ratio vs CPU Over Time", y = "Value", x = "Time")
+ggI(p)
+
+```
+
+```{r}
+# Convert CCF object into a data frame and plot
+ccf_warn <- ccf(aligned_data$trace_op_ratio, aligned_data$warn_count, plot = FALSE, na.action = na.omit)
+ccf_df <- data.frame(lag = ccf_warn$lag, acf = ccf_warn$acf)
+
+plot_ly(ccf_df, x = ~lag, y = ~acf, type = "bar") %>%
+  layout(title = "CCF: trace_op_ratio vs warn_count",
+         xaxis = list(title = "Lag"), yaxis = list(title = "Correlation"))
+
+```
+
+```{r}
+corr_data <- aligned_minute %>%
+  select(cpu, mem, load1, log_count, warn_count, error_count, trace_count, total_ops) %>%
+  na.omit()
+
+corr_matrix <- cor(corr_data, use = "complete.obs")
+
+plot_ly(
+  x = colnames(corr_matrix),
+  y = colnames(corr_matrix),
+  z = corr_matrix,
+  type = "heatmap",
+  colors = vir
+) %>% layout(title = "Correlation Matrix: Logs, Metrics, Traces (Per Minute)")
+
+```
+
+
+```{r}
+library(pROC)
+probs_strict <- predict(rf_model_strict, newdata = test_data, type = "prob")[,2]
+roc_obj <- roc(test_data$anomaly_label_strict, probs_strict)
+
+roc_df <- data.frame(
+  specificity = roc_obj$specificities,
+  sensitivity = roc_obj$sensitivities
+)
+
+plot_ly(roc_df, x = ~1-specificity, y = ~sensitivity, type = "scatter", mode = "lines") %>%
+  layout(title = paste0("ROC Curve - RF Strict Labels (AUC = ", round(auc(roc_obj), 3), ")"),
+         xaxis = list(title = "1 - Specificity (FPR)"),
+         yaxis = list(title = "Sensitivity (TPR)"))
+
+```
+
+```{r}
+imp <- importance(rf_model_strict)
+imp_df <- data.frame(Feature = rownames(imp), MeanDecreaseAccuracy = imp[, "MeanDecreaseAccuracy"])
+
+plot_ly(imp_df, x = ~MeanDecreaseAccuracy, y = ~reorder(Feature, MeanDecreaseAccuracy),
+        type = "bar", orientation = "h") %>%
+  layout(title = "Feature Importance (RF - Strict Labels)",
+         xaxis = list(title = "Mean Decrease Accuracy"),
+         yaxis = list(title = "Feature"))
+
+```
+
+```{r}
+conf_mat_df <- as.data.frame(conf_mat_strict)
+colnames(conf_mat_df) <- c("Predicted", "Actual", "Freq")
+
+plot_ly(conf_mat_df,
+        x = ~Actual, y = ~Predicted, z = ~Freq,
+        type = "heatmap", colors = vir) %>%
+  add_text(text = ~Freq, texttemplate = "%{text}", textfont = list(color="white")) %>%
+  layout(title = "Confusion Matrix (RF - Strict Labels)")
+
+```
+
+```{r}
+datatable(head(logs_filtered, 50), options = list(pageLength = 10), rownames = FALSE)
+datatable(head(metrics_filtered, 50), options = list(pageLength = 10), rownames = FALSE)
+datatable(head(traces_filtered, 50), options = list(pageLength = 10), rownames = FALSE)
+datatable(anomalies, options = list(pageLength = 10), rownames = FALSE)
+
+```
+
+
+```{r}
+# 1) Overlay per-minute (Logs, CPU, Traces)
+p1 <- ggplot(aligned_minute, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count), color = "Logs")) +
+  geom_line(aes(y = scale(cpu),       color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  labs(title = "Overlay Time Series: Logs, CPU, Traces (Per Minute)",
+       y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green")) +
+  theme_minimal()
+ggI(p1)
+
+# 2) Overlay + Warnings & Errors
+p2 <- ggplot(aligned_minute, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count),   color = "Logs")) +
+  geom_line(aes(y = scale(cpu),         color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  geom_line(aes(y = scale(warn_count),  color = "Warnings"), linetype = "dashed") +
+  geom_line(aes(y = scale(error_count), color = "Errors"),   linetype = "dotted") +
+  labs(title = "Overlay Time Series with Warnings & Errors",
+       y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green",
+                                "Warnings" = "orange", "Errors" = "black")) +
+  theme_minimal()
+ggI(p2)
+
+# 3) Overlay + shaded report windows
+report_events <- reports %>%
+  select(subtask_title, subtask_created_at, subtask_updated_at)
+
+p3 <- ggplot(aligned_minute, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count),   color = "Logs")) +
+  geom_line(aes(y = scale(cpu),         color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  geom_rect(data = report_events,
+            aes(xmin = subtask_created_at, xmax = subtask_updated_at,
+                ymin = -Inf, ymax = Inf, fill = subtask_title),
+            alpha = 0.2, inherit.aes = FALSE) +
+  labs(title = "Overlay with External Report Events",
+       y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green")) +
+  theme_minimal()
+ggI(p3)
+
+```
+
+```{r}
+library(dplyr)
+library(plotly)
+library(RColorBrewer)
+
+# Precompute scaled series as plain numerics (avoids ggplotly/scale() weirdness)
+am <- aligned_minute %>%
+  mutate(
+    log_s   = as.numeric(scale(log_count)),
+    cpu_s   = as.numeric(scale(cpu)),
+    trace_s = as.numeric(scale(trace_count))
+  )
+
+# Build shapes for shaded windows (non-hovering background)
+re <- reports %>% select(subtask_title, subtask_created_at, subtask_updated_at)
+cols <- if (nrow(re) > 0) RColorBrewer::brewer.pal(min(8, nrow(re)), "Set2") else character(0)
+
+shapes <- lapply(seq_len(nrow(re)), function(i) {
+  list(
+    type = "rect", xref = "x", yref = "paper",
+    x0 = re$subtask_created_at[i], x1 = re$subtask_updated_at[i],
+    y0 = 0, y1 = 1, line = list(width = 0),
+    fillcolor = cols[(i-1) %% max(1, length(cols)) + 1], opacity = 0.15
+  )
+})
+
+# Interactive overlay with proper hovers
+p3 <- plot_ly(am, x = ~minute) %>%
+  add_lines(y = ~log_s,   name = "Logs",   hovertemplate = "Time:%{x}<br>Logs (scaled):%{y:.3f}<extra></extra>") %>%
+  add_lines(y = ~cpu_s,   name = "CPU",    hovertemplate = "Time:%{x}<br>CPU (scaled):%{y:.3f}<extra></extra>") %>%
+  add_lines(y = ~trace_s, name = "Traces", hovertemplate = "Time:%{x}<br>Traces (scaled):%{y:.3f}<extra></extra>") %>%
+  layout(
+    title = "Overlay with External Report Events",
+    xaxis = list(title = "Time"),
+    yaxis = list(title = "Scaled values"),
+    shapes = shapes,
+    legend = list(orientation = "h", x = 0, y = 1.1)
+  )
+
+p3
+
+```
+
+```{r}
+# assumes you already built corr_matrix
+library(plotly)
+library(viridis)
+
+corr_df <- as.data.frame(corr_matrix)
+vars <- colnames(corr_df)
+
+# Heatmap with hover + centered numeric labels
+p_corr <- plot_ly(
+  x = vars, y = vars, z = as.matrix(corr_df),
+  type = "heatmap", colors = viridis::viridis(200),
+  zmin = -1, zmax = 1, colorbar = list(title = "Correlation")
+) %>%
+  layout(
+    title = "Correlation Matrix: Logs, Metrics, Traces (Per Minute)",
+    xaxis = list(title = "", tickangle = 45),
+    yaxis = list(title = "", autorange = "reversed")
+  ) %>%
+  add_text(
+    x = rep(vars, each = length(vars)),
+    y = rep(vars, times = length(vars)),
+    text = sprintf("%.2f", as.vector(as.matrix(corr_df))),
+    textfont = list(color = "black", size = 10),
+    showlegend = FALSE
+  )
+
+p_corr
+
+```
+
+//
+
+```{r}
+# Artefact helper (add once)
+# install.packages("htmlwidgets")  # if needed
+library(htmlwidgets)
+
+dir.create("artefacts", showWarnings = FALSE, recursive = TRUE)
+
+save_w <- function(widget, name) {
+  # Ensures single-file HTML you can drop into Shiny
+  htmlwidgets::saveWidget(widget, file = file.path("artefacts", name), selfcontained = TRUE)
+  message("Saved: artefacts/", name)
+}
+
+```
+
+```{r}
+# Distribution of log levels
+p <- logs_filtered %>%
+  count(log_level, sort = TRUE) %>%
+  ggplot(aes(x = reorder(log_level, n), y = n, text = paste("Level:", log_level, "<br>Count:", n))) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Log Level Distribution", x = "Log Level", y = "Count")
+w <- ggI(p); save_w(w, "log_level_distribution.html")
+
+# HTTP status distribution (ignoring NAs)
+p <- logs_filtered %>%
+  filter(!is.na(http_status)) %>%
+  count(http_status) %>%
+  ggplot(aes(x = http_status, y = n, text = paste("Status:", http_status, "<br>Count:", n))) +
+  geom_col() +
+  labs(title = "HTTP Status Codes", x = "Status Code", y = "Count")
+w <- ggI(p); save_w(w, "http_status_distribution.html")
+
+# Logs over time
+p <- logs_filtered %>%
+  mutate(minute = lubridate::floor_date(`@timestamp`, "minute")) %>%
+  count(minute) %>%
+  ggplot(aes(x = minute, y = n, text = paste("Time:", minute, "<br>Logs/min:", n))) +
+  geom_line() +
+  labs(title = "Log Volume Over Time", x = "Time", y = "Logs per Minute")
+w <- ggI(p); save_w(w, "logs_over_time.html")
+
+```
+
+```{r}
+# CPU distribution
+p <- ggplot(metrics_filtered, aes(x = cpu.user, text = paste("CPU %:", round(cpu.user,2)))) +
+  geom_histogram(bins = 50) +
+  labs(title = "CPU Usage Distribution", x = "CPU %", y = "Count")
+w <- ggI(p); save_w(w, "cpu_usage_distribution.html")
+
+# Memory usage distribution (GB)
+p <- ggplot(metrics_filtered, aes(x = mem.used/1e9, text = paste("Mem (GB):", round(mem.used/1e9,2)))) +
+  geom_histogram(bins = 50) +
+  labs(title = "Memory Usage Distribution", x = "Memory (GB)", y = "Count")
+w <- ggI(p); save_w(w, "memory_usage_distribution.html")
+
+# Time series: CPU usage
+p <- metrics_filtered %>%
+  mutate(minute = lubridate::floor_date(now, "minute")) %>%
+  group_by(minute) %>%
+  summarise(cpu_avg = mean(cpu.user, na.rm = TRUE), .groups="drop") %>%
+  ggplot(aes(x = minute, y = cpu_avg, text = paste("Time:", minute, "<br>CPU avg:", round(cpu_avg,2)))) +
+  geom_line() +
+  labs(title = "Average CPU Usage Over Time", x = "Time", y = "CPU %")
+w <- ggI(p); save_w(w, "cpu_usage_over_time.html")
+
+# Correlation heatmap (Plotly)
+metrics_num <- metrics_filtered %>% select(cpu.user, mem.used, load.min1, load.min5, load.min15)
+cor_mat <- cor(metrics_num, use = "pairwise.complete.obs")
+w <- plot_ly(
+  x = colnames(cor_mat),
+  y = colnames(cor_mat),
+  z = cor_mat,
+  type = "heatmap",
+  colors = vir
+) %>% layout(title = "Correlation Heatmap of Metrics")
+save_w(w, "metrics_correlation_heatmap.html")
+
+```
+
+```{r}
+# CPU distribution
+p <- ggplot(metrics_filtered, aes(x = cpu.user, text = paste("CPU %:", round(cpu.user,2)))) +
+  geom_histogram(bins = 50) +
+  labs(title = "CPU Usage Distribution", x = "CPU %", y = "Count")
+w <- ggI(p); save_w(w, "cpu_usage_distribution.html")
+
+# Memory usage distribution (GB)
+p <- ggplot(metrics_filtered, aes(x = mem.used/1e9, text = paste("Mem (GB):", round(mem.used/1e9,2)))) +
+  geom_histogram(bins = 50) +
+  labs(title = "Memory Usage Distribution", x = "Memory (GB)", y = "Count")
+w <- ggI(p); save_w(w, "memory_usage_distribution.html")
+
+# Time series: CPU usage
+p <- metrics_filtered %>%
+  mutate(minute = lubridate::floor_date(now, "minute")) %>%
+  group_by(minute) %>%
+  summarise(cpu_avg = mean(cpu.user, na.rm = TRUE), .groups="drop") %>%
+  ggplot(aes(x = minute, y = cpu_avg, text = paste("Time:", minute, "<br>CPU avg:", round(cpu_avg,2)))) +
+  geom_line() +
+  labs(title = "Average CPU Usage Over Time", x = "Time", y = "CPU %")
+w <- ggI(p); save_w(w, "cpu_usage_over_time.html")
+
+# Correlation heatmap (Plotly)
+metrics_num <- metrics_filtered %>% select(cpu.user, mem.used, load.min1, load.min5, load.min15)
+cor_mat <- cor(metrics_num, use = "pairwise.complete.obs")
+w <- plot_ly(
+  x = colnames(cor_mat),
+  y = colnames(cor_mat),
+  z = cor_mat,
+  type = "heatmap",
+  colors = vir
+) %>% layout(title = "Correlation Heatmap of Metrics")
+save_w(w, "metrics_correlation_heatmap.html")
+
+```
+
+```{r}
+# Top operations
+top_ops <- traces_filtered %>%
+  count(operation, sort = TRUE) %>%
+  slice_head(n = 15)
+w <- datatable(top_ops, options = list(pageLength = 15), rownames = FALSE)
+save_w(w, "traces_top_operations.html")
+
+# Count by project
+proj_counts <- traces_filtered %>%
+  count(Project, sort = TRUE)
+w <- datatable(proj_counts, options = list(pageLength = 10), rownames = FALSE)
+save_w(w, "traces_project_counts.html")
+
+# Trace events over time
+p <- traces_filtered %>%
+  mutate(minute = lubridate::floor_date(Timestamp, "minute")) %>%
+  count(minute) %>%
+  ggplot(aes(x = minute, y = n, text = paste("Time:", minute, "<br>Traces:", n))) +
+  geom_line() +
+  labs(title = "Trace Events Over Time", x = "Time", y = "Count")
+w <- ggI(p); save_w(w, "trace_events_over_time.html")
+
+```
+
+
+```{r}
+traces_by_op <- traces %>%
+  mutate(minute = lubridate::floor_date(Timestamp, "minute")) %>%
+  group_by(minute, operation) %>%
+  summarise(trace_count = n(), .groups="drop")
+
+p <- ggplot(traces_by_op, aes(x = minute, y = trace_count, color = operation,
+                              text = paste("Time:", minute, "<br>Op:", operation, "<br>Count:", trace_count))) +
+  geom_line() +
+  labs(title = "Trace Volume by Operation", x = "Time", y = "Trace Count")
+w <- ggI(p); save_w(w, "trace_volume_by_operation.html")
+
+```
+
+```{r}
+report_events <- reports %>%
+  select(subtask_title, subtask_created_at, subtask_updated_at)
+
+p <- ggplot(overlay, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count), color = "Logs")) +
+  geom_line(aes(y = scale(cpu), color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  geom_rect(
+    data = report_events,
+    aes(xmin = subtask_created_at, xmax = subtask_updated_at,
+        ymin = -Inf, ymax = Inf, fill = subtask_title),
+    alpha = 0.2, inherit.aes = FALSE
+  ) +
+  labs(title = "Overlay with External Report Events", y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green"))
+w <- ggI(p); save_w(w, "overlay_with_reports_ggplotly.html")
+
+```
+
+```{r}
+w <- plot_ly(x = ~aligned_data$cpu.user_avg, type = "histogram", nbinsx = 50) %>% 
+  layout(title = "cpu.user_avg")
+save_w(w, "hist_cpu_user_avg.html")
+
+w <- plot_ly(x = ~aligned_data$mem.used_avg, type = "histogram", nbinsx = 50) %>% 
+  layout(title = "mem.used_avg")
+save_w(w, "hist_mem_used_avg.html")
+
+```
+
+```{r}
+# 1) Time series
+p <- ggplot(aligned_data, aes(x = window, y = trace_op_ratio,
+                              text = paste("Window:", window, "<br>Ratio:", round(trace_op_ratio,3)))) +
+  geom_line() +
+  labs(title = "Trace-to-Operation Ratio Over Time", x = "Time Window", y = "Trace Count / Total Ops") +
+  theme_minimal()
+w <- ggI(p); save_w(w, "ratio_time_series.html")
+
+# 2) Scatter vs errors
+p <- ggplot(aligned_data, aes(x = trace_op_ratio, y = error_count,
+                              text = paste("Ratio:", round(trace_op_ratio,3), "<br>Errors:", error_count))) +
+  geom_point(alpha = 0.6) +
+  labs(title = "Trace-to-Operation Ratio vs Error Count", x = "Trace Count / Total Ops", y = "Error Count")
+w <- ggI(p); save_w(w, "ratio_vs_errors_scatter.html")
+
+# 3) Distribution
+p <- ggplot(aligned_data, aes(x = trace_op_ratio, text = paste("Ratio:", round(trace_op_ratio,3)))) +
+  geom_histogram(bins = 50) +
+  labs(title = "Distribution of Trace-to-Operation Ratio", x = "Trace Count / Total Ops", y = "Frequency")
+w <- ggI(p); save_w(w, "ratio_distribution.html")
+
+# Overlays with errors and CPU (normalized)
+norm_err <- max(aligned_data$error_count, na.rm=TRUE)
+norm_cpu <- max(aligned_data$cpu.user_avg, na.rm=TRUE)
+
+p <- ggplot(aligned_data, aes(x = window)) +
+  geom_line(aes(y = trace_op_ratio, color = "Trace Ratio")) +
+  geom_line(aes(y = error_count / norm_err, color = "Errors (norm)")) +
+  labs(title = "Trace Ratio vs Errors Over Time", y = "Value", x = "Time")
+w <- ggI(p); save_w(w, "ratio_vs_errors_timeseries.html")
+
+p <- ggplot(aligned_data, aes(x = window)) +
+  geom_line(aes(y = trace_op_ratio, color = "Trace Ratio")) +
+  geom_line(aes(y = cpu.user_avg / norm_cpu, color = "CPU (norm)")) +
+  labs(title = "Trace Ratio vs CPU Over Time", y = "Value", x = "Time")
+w <- ggI(p); save_w(w, "ratio_vs_cpu_timeseries.html")
+
+```
+
+```{r}
+ccf_warn <- ccf(aligned_data$trace_op_ratio, aligned_data$warn_count, plot = FALSE, na.action = na.omit)
+ccf_df <- data.frame(lag = ccf_warn$lag, acf = ccf_warn$acf)
+
+w <- plot_ly(ccf_df, x = ~lag, y = ~acf, type = "bar") %>%
+  layout(title = "CCF: trace_op_ratio vs warn_count",
+         xaxis = list(title = "Lag"), yaxis = list(title = "Correlation"))
+save_w(w, "ccf_trace_ratio_vs_warn.html")
+
+```
+
+
+```{r}
+corr_data <- aligned_minute %>%
+  select(cpu, mem, load1, log_count, warn_count, error_count, trace_count, total_ops) %>%
+  na.omit()
+
+corr_matrix <- cor(corr_data, use = "complete.obs")
+
+w <- plot_ly(
+  x = colnames(corr_matrix),
+  y = colnames(corr_matrix),
+  z = corr_matrix,
+  type = "heatmap",
+  colors = vir
+) %>% layout(title = "Correlation Matrix: Logs, Metrics, Traces (Per Minute)")
+save_w(w, "corr_matrix_minute.html")
+
+```
+
+```{r}
+library(pROC)
+probs_strict <- predict(rf_model_strict, newdata = test_data, type = "prob")[,2]
+roc_obj <- roc(test_data$anomaly_label_strict, probs_strict)
+
+roc_df <- data.frame(
+  specificity = roc_obj$specificities,
+  sensitivity = roc_obj$sensitivities
+)
+
+w <- plot_ly(roc_df, x = ~1-specificity, y = ~sensitivity, type = "scatter", mode = "lines") %>%
+  layout(title = paste0("ROC Curve - RF Strict Labels (AUC = ", round(auc(roc_obj), 3), ")"),
+         xaxis = list(title = "1 - Specificity (FPR)"),
+         yaxis = list(title = "Sensitivity (TPR)"))
+save_w(w, "roc_rf_strict.html")
+
+```
+
+
+```{r}
+imp <- importance(rf_model_strict)
+imp_df <- data.frame(Feature = rownames(imp), MeanDecreaseAccuracy = imp[, "MeanDecreaseAccuracy"])
+
+w <- plot_ly(imp_df, x = ~MeanDecreaseAccuracy, y = ~reorder(Feature, MeanDecreaseAccuracy),
+        type = "bar", orientation = "h") %>%
+  layout(title = "Feature Importance (RF - Strict Labels)",
+         xaxis = list(title = "Mean Decrease Accuracy"),
+         yaxis = list(title = "Feature"))
+save_w(w, "rf_feature_importance.html")
+
+```
+
+```{r}
+conf_mat_df <- as.data.frame(conf_mat_strict)
+colnames(conf_mat_df) <- c("Predicted", "Actual", "Freq")
+
+w <- plot_ly(conf_mat_df,
+        x = ~Actual, y = ~Predicted, z = ~Freq,
+        type = "heatmap", colors = vir) %>%
+  add_text(text = ~Freq, texttemplate = "%{text}", textfont = list(color="white")) %>%
+  layout(title = "Confusion Matrix (RF - Strict Labels)")
+save_w(w, "rf_confusion_matrix.html")
+
+```
+
+```{r}
+w <- datatable(head(logs_filtered, 50), options = list(pageLength = 10), rownames = FALSE)
+save_w(w, "table_logs_head.html")
+
+w <- datatable(head(metrics_filtered, 50), options = list(pageLength = 10), rownames = FALSE)
+save_w(w, "table_metrics_head.html")
+
+w <- datatable(head(traces_filtered, 50), options = list(pageLength = 10), rownames = FALSE)
+save_w(w, "table_traces_head.html")
+
+w <- datatable(anomalies, options = list(pageLength = 10), rownames = FALSE)
+save_w(w, "table_anomalies.html")
+
+```
+
+```{r}
+# 1) Overlay per-minute (Logs, CPU, Traces)
+p1 <- ggplot(aligned_minute, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count), color = "Logs")) +
+  geom_line(aes(y = scale(cpu),       color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  labs(title = "Overlay Time Series: Logs, CPU, Traces (Per Minute)",
+       y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green")) +
+  theme_minimal()
+w <- ggI(p1); save_w(w, "overlay_minute_ggplotly.html")
+
+# 2) Overlay + Warnings & Errors
+p2 <- ggplot(aligned_minute, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count),   color = "Logs")) +
+  geom_line(aes(y = scale(cpu),         color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  geom_line(aes(y = scale(warn_count),  color = "Warnings"), linetype = "dashed") +
+  geom_line(aes(y = scale(error_count), color = "Errors"),   linetype = "dotted") +
+  labs(title = "Overlay Time Series with Warnings & Errors",
+       y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green",
+                                "Warnings" = "orange", "Errors" = "black")) +
+  theme_minimal()
+w <- ggI(p2); save_w(w, "overlay_minute_we_ggplotly.html")
+
+# 3) Overlay + shaded report windows (ggplotly)
+report_events <- reports %>%
+  select(subtask_title, subtask_created_at, subtask_updated_at)
+
+p3 <- ggplot(aligned_minute, aes(x = minute)) +
+  geom_line(aes(y = scale(log_count),   color = "Logs")) +
+  geom_line(aes(y = scale(cpu),         color = "CPU")) +
+  geom_line(aes(y = scale(trace_count), color = "Traces")) +
+  geom_rect(data = report_events,
+            aes(xmin = subtask_created_at, xmax = subtask_updated_at,
+                ymin = -Inf, ymax = Inf, fill = subtask_title),
+            alpha = 0.2, inherit.aes = FALSE) +
+  labs(title = "Overlay with External Report Events",
+       y = "Scaled values", x = "Time") +
+  scale_color_manual(values = c("Logs" = "blue", "CPU" = "red", "Traces" = "green")) +
+  theme_minimal()
+w <- ggI(p3); save_w(w, "overlay_minute_reports_ggplotly.html")
+
+```
+
+```{r}
+library(dplyr); library(plotly); library(RColorBrewer)
+
+am <- aligned_minute %>%
+  mutate(
+    log_s   = as.numeric(scale(log_count)),
+    cpu_s   = as.numeric(scale(cpu)),
+    trace_s = as.numeric(scale(trace_count))
+  )
+
+re <- reports %>% select(subtask_title, subtask_created_at, subtask_updated_at)
+cols <- if (nrow(re) > 0) RColorBrewer::brewer.pal(min(8, nrow(re)), "Set2") else character(0)
+shapes <- lapply(seq_len(nrow(re)), function(i) {
+  list(type = "rect", xref = "x", yref = "paper",
+       x0 = re$subtask_created_at[i], x1 = re$subtask_updated_at[i],
+       y0 = 0, y1 = 1, line = list(width = 0),
+       fillcolor = cols[(i-1) %% max(1, length(cols)) + 1], opacity = 0.15)
+})
+
+w <- plot_ly(am, x = ~minute) %>%
+  add_lines(y = ~log_s,   name = "Logs",   hovertemplate = "Time:%{x}<br>Logs (scaled):%{y:.3f}<extra></extra>") %>%
+  add_lines(y = ~cpu_s,   name = "CPU",    hovertemplate = "Time:%{x}<br>CPU (scaled):%{y:.3f}<extra></extra>") %>%
+  add_lines(y = ~trace_s, name = "Traces", hovertemplate = "Time:%{x}<br>Traces (scaled):%{y:.3f}<extra></extra>") %>%
+  layout(title = "Overlay with External Report Events",
+         xaxis = list(title = "Time"), yaxis = list(title = "Scaled values"),
+         shapes = shapes, legend = list(orientation = "h", x = 0, y = 1.1))
+save_w(w, "overlay_minute_reports_plotly.html")
+
+```
+
+
+```{r}
+corr_df <- as.data.frame(corr_matrix); vars <- colnames(corr_df)
+w <- plot_ly(
+  x = vars, y = vars, z = as.matrix(corr_df),
+  type = "heatmap", colors = viridis::viridis(200),
+  zmin = -1, zmax = 1, colorbar = list(title = "Correlation")
+) %>% layout(
+  title = "Correlation Matrix: Logs, Metrics, Traces (Per Minute)",
+  xaxis = list(title = "", tickangle = 45),
+  yaxis = list(title = "", autorange = "reversed")
+) %>% add_text(
+  x = rep(vars, each = length(vars)),
+  y = rep(vars, times = length(vars)),
+  text = sprintf("%.2f", as.vector(as.matrix(corr_df))),
+  textfont = list(color = "black", size = 10),
+  showlegend = FALSE
+)
+save_w(w, "corr_matrix_minute_labeled.html")
+
+```
+
